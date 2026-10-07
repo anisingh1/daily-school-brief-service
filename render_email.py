@@ -2,12 +2,10 @@
 Renders the daily school brief's structured content into a polished,
 section-based HTML email body.
 
-Takes a structured dict (produced by the daily-school-brief skill's own
-judgment/categorization step - see
-.claude/skills/daily-school-brief/SKILL.md) rather than raw scraped
-messages, so the visual design is deterministic and consistent every day
-regardless of that day's content. Claude decides *what* goes in the
-brief; this module decides *how it looks*.
+Takes a structured dict (produced and validated by generate_brief.py)
+rather than raw scraped messages, so the visual design is deterministic
+and consistent every day regardless of that day's content. Azure GPT
+decides what goes in the brief; this module decides how it looks.
 
 Expected `data` keys: `date` (str), `warnings` (list[str]),
 `aviraj_highlight` (str | None), `classwork` (list[str]), `homework`
@@ -21,8 +19,7 @@ from html import escape
 def _as_list(value) -> list[str]:
     """Normalize a list-typed field that may arrive as a bare string.
 
-    The upstream skill produces `data` via LLM judgment, so a single-item
-    field could plausibly come out as a bare string instead of a
+    Legacy or hand-authored content may contain a bare string instead of a
     single-element list. Iterating a bare string directly would silently
     produce one <li> per character, so callers should always route
     list-typed fields through this helper first.

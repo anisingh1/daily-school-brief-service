@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import daily_brief
 
 
@@ -172,3 +174,60 @@ def test_run_writes_output_file(monkeypatch, tmp_path):
 
     assert out_path.exists()
     assert json.loads(out_path.read_text()) == result == fixed_result
+
+
+@pytest.mark.parametrize("from_input", [False, True])
+def test_pipeline_generates_writes_and_previews(monkeypatch, tmp_path, from_input):
+    data = {"portal": {"messages": [{"body": "homework"}], "error": None}}
+    input_path = tmp_path / "input.json"
+    input_path.write_text(json.dumps(data))
+    monkeypatch.setattr(daily_brief, "OUTPUT_PATH", input_path)
+    monkeypatch.setattr(daily_brief.generate_brief, "CONTENT_PATH", tmp_path / "content.json")
+    calls = []
+    def collect():
+        calls.append("collect")
+        return data
+    def generate(source_data, now):
+        assert source_data == data
+        assert now.tzinfo == daily_brief.generate_brief.IST
+        calls.append("generate")
+        return daily_brief.generate_brief.empty_brief("date", [])
+    monkeypatch.setattr(daily_brief, "run", collect)
+    monkeypatch.setattr(daily_brief.generate_brief, "generate", generate)
+    monkeypatch.setattr(daily_brief.send_email, "run", lambda preview: calls.append(("send", preview)))
+    monkeypatch.setattr(daily_brief.commit_archive, "commit_and_push", lambda: pytest.fail("Unexpected commit"))
+    assert daily_brief.run_pipeline(preview=True, from_input=from_input)
+    assert calls == (["generate", ("send", True)] if from_input else ["collect", "generate", ("send", True)])
+    assert json.loads((tmp_path / "content.json").read_text())["homework"] == []
+
+
+@pytest.mark.parametrize("stage", ["collect", "generate", "archive"])
+def test_pipeline_replaces_stale_content_with_warning_and_still_delivers(monkeypatch, tmp_path, stage):
+    content_path = tmp_path / "content.json"
+    content_path.write_text('{"homework": ["stale"]}')
+    monkeypatch.setattr(daily_brief.generate_brief, "CONTENT_PATH", content_path)
+    data = {"portal": {"messages": [], "error": "portal unavailable"}}
+    def fail(*args, **kwargs):
+        raise RuntimeError("sensitive detail that should not be emailed")
+    monkeypatch.setattr(daily_brief, "run", fail if stage == "collect" else lambda: data)
+    monkeypatch.setattr(daily_brief.generate_brief, "generate", fail if stage == "generate" else lambda *args, **kwargs: pytest.fail("Unexpected generation"))
+    monkeypatch.setattr(daily_brief.commit_archive, "commit_and_push", fail if stage == "archive" else lambda: pytest.fail("Unexpected commit"))
+    sent = []
+    monkeypatch.setattr(daily_brief.send_email, "run", lambda preview: sent.append(preview))
+    assert not daily_brief.run_pipeline(persist_archive=stage == "archive")
+    result = json.loads(content_path.read_text())
+    assert result["homework"] == []
+    assert "RuntimeError" in result["warnings"][-1]
+    assert "sensitive detail" not in content_path.read_text()
+    assert sent == [False]
+
+
+def test_pipeline_includes_recoverable_archive_warning(monkeypatch, tmp_path):
+    monkeypatch.setattr(daily_brief.generate_brief, "CONTENT_PATH", tmp_path / "content.json")
+    monkeypatch.setattr(daily_brief, "run", lambda: {})
+    monkeypatch.setattr(daily_brief.commit_archive, "commit_and_push", lambda: print("WARNING: push rejected"))
+    monkeypatch.setattr(daily_brief.generate_brief, "generate", lambda *args, **kwargs: daily_brief.generate_brief.empty_brief("date", []))
+    monkeypatch.setattr(daily_brief.send_email, "run", lambda preview: None)
+    assert daily_brief.run_pipeline(preview=True, persist_archive=True)
+    result = json.loads((tmp_path / "content.json").read_text())
+    assert "could not be pushed" in result["warnings"][0]

@@ -1,210 +1,34 @@
 ---
 name: daily-school-brief
-description: Generate the daily school brief (homework, tomorrow's agenda, dress code, other reminders) from the school portal and WhatsApp group logs, and send it as an HTML email. Use when asked to run or generate the daily school brief, or on the scheduled evening trigger.
+description: Run the Azure OpenAI daily school brief pipeline and deliver its HTML email. Use when asked to run or generate the daily school brief, or on an existing scheduled evening trigger.
 ---
 
 # Daily School Brief
 
-## What this does
+This is a compatibility launcher for existing agent-based triggers. The Python
+pipeline performs collection, PDF reading, Azure GPT generation, validation,
+HTML rendering, and delivery. Claude must not categorize or rewrite content.
+The application can also run directly without this skill or Claude Code.
 
-Combines two message sources - the school web portal (with a permanent,
-git-committed archive of every message ever scraped) and the school
-WhatsApp group (captured via phone automation into a Google Drive file,
-covering a couple days before the start of the current calendar month
-onward) - and produces a short brief covering:
-
-- Homework
-- Tomorrow's school agenda (events, holidays, notices)
-- Tomorrow's dress code
-- Other reminders
-
-Then writes it as structured content and sends it as an HTML email.
-
-## Steps
-
-1. From the project root, run:
+1. Change to the project root containing `daily_brief.py`. Use the configured
+   Python environment; activate `.venv` if that is the installed environment.
+2. For a persistent local installation, run exactly once:
 
    ```bash
    python daily_brief.py
    ```
 
-   The project root is the directory containing `daily_brief.py`,
-   `scrape_udt.py`, and `fetch_whatsapp.py`. If you're not already
-   there (e.g. in a fresh clone on a scheduled cloud routine), `cd`
-   into it first before running the command.
-
-   This writes `output/daily_brief_input.json` with two sections,
-   `portal` and `whatsapp`, each having `messages` (a list) and `error`
-   (a string or null). The portal's `messages` list is the FULL
-   accumulated archive (every message ever scraped), not just what's
-   new this run. Portal and WhatsApp messages alike may include an
-   `attachments` list; a downloaded attachment has a `saved_as` local
-   file path (WhatsApp attachments are always PDFs - other file types
-   are filtered out before this point).
-
-   If `python daily_brief.py` fails to run (crashes, `python` not
-   found, etc.) or `output/daily_brief_input.json` does not exist
-   afterward, don't stop silently - write
-   `output/daily_brief_content.json` with just a `warnings` entry
-   describing the failure (all other fields empty/`null` - see step 8
-   for the exact shape) and run `python send_email.py` anyway, so you
-   still get an email saying the brief couldn't be generated, including
-   a short reason if one is available. Then stop there.
-
-2. Commit and push any changes under `data/` (the portal message
-   archive, cursor, and downloaded PDFs) so they persist for the next
-   run:
+   For a scheduled environment that clones the repository fresh each run,
+   preserve the archive with:
 
    ```bash
-   python commit_archive.py
+   python daily_brief.py --commit-archive
    ```
 
-   This is necessary because a scheduled cloud routine clones this repo
-   fresh on every run - anything written to `data/` during this run is
-   lost unless it's committed and pushed back before the run ends.
-   `commit_archive.py` stages `data/`, commits only if there's something
-   staged, and pushes - see its docstring for exactly what it runs. If
-   the push is rejected (no push access, or a non-fast-forward rejection
-   because another run or a human pushed in between), the script prints
-   a warning instead of raising - just note that warning in the brief
-   and continue. A failure here doesn't affect today's brief, only
-   whether tomorrow's run starts from today's updated archive, and it's
-   safe to just let the next run retry from wherever the remote actually
-   is. Only treat this step as a hard failure (worth stopping over) if
-   the script raises/exits with an error instead of printing a push
-   warning - that means `git add` or `git commit` itself failed, which
-   is not the expected/recoverable case.
+   If the user explicitly requests a preview without email, add `--preview`.
+3. Report the command result. A nonzero exit can mean a warning-only email was
+   delivered after generation failed; do not claim a normal brief succeeded.
 
-3. Read `output/daily_brief_input.json` (path relative to the project
-   root from step 1 - this only works if you're actually in that
-   directory when you run step 1).
-
-4. For each portal or WhatsApp message that has an attachment with a
-   `saved_as` path, `Read` that file directly (Claude Code's `Read`
-   tool handles PDFs natively). Homework, agenda, and dress-code
-   details are often
-   inside the document itself - a monthly planner PDF, for instance -
-   rather than in the message body text, so don't rely on the body
-   text alone when an attachment is present.
-
-5. For each source with a non-null `error`, note it as a warning to
-   include at the top of the brief (e.g. "couldn't reach school
-   portal") - a failure in one source should not stop you from using
-   the other source's messages.
-
-6. If both sources have zero messages and no errors, the brief is just:
-   "Nothing new from the school portal or WhatsApp group."
-
-7. Otherwise, read through all messages (and any attachment content
-   read in step 4) from both sources and use your own judgment to
-   extract (the content is unstructured free text - don't pattern-match
-   on fixed keywords):
-
-   The child this brief is for is **Aviraj**. Whenever a message names
-   him specifically (rather than just addressing the class in general),
-   call that out prominently at the very top of the brief (e.g. prefix
-   it with "⭐ For Aviraj:") - a task or note addressed to him by name
-   is more important than a generic class-wide notice and should stand
-   out, not get buried among the class-wide items below.
-
-   Conversely, some documents (e.g. an assembly schedule) pair each
-   day's specific content - a "thought of the day," a "word of the
-   day," a specific activity - with the named student assigned to
-   present or lead it that day. When that pairing exists, the content
-   is only relevant if Aviraj is the student named for that day - check
-   the roster/assignment table before including anything from it. If
-   he isn't assigned anything for the day the brief covers, leave that
-   entire item out (don't report a classmate's assigned thought/word/
-   activity as if it were general class information). A genuinely
-   class-wide detail with no per-student assignment attached (e.g. "no
-   school Friday for a holiday," a schedule change affecting everyone)
-   is unaffected by this and should still be included normally.
-
-   - **Classwork**: what was covered in class (typically marked "C.W."
-     in a Flow of the Day post) on the most recent school day.
-   - **Homework**: any assignment, reading, or task mentioned for the
-     child to do (typically marked "Recap" in a Flow of the Day post).
-
-     **Carry-forward rule**: Classwork and Homework should always
-     reflect the most recent school day that had a Flow of the Day
-     post, even if that's not today. If today (IST) is a weekend or a
-     holiday (so no new Flow of the Day post exists for today), just
-     carry forward the most recent available post's classwork and
-     homework rather than leaving these sections empty - don't add a
-     warning or note explaining why (a holiday/weekend is expected,
-     ordinary, and already evident from the activity calendar - it
-     isn't an anomaly worth flagging).
-   - **Tomorrow's agenda**: events, special activities, holidays, timing
-     changes, or notices that apply to tomorrow specifically (use
-     today's date in IST - India Standard Time, UTC+5:30, the school's
-     timezone - to work out what "tomorrow" refers to; do not use the
-     local timezone of the machine or sandbox running this skill).
-     Content posted at any point in the past (e.g. a monthly planner
-     from weeks ago) that happens to apply to tomorrow counts just as
-     much as something posted today - the portal archive is complete,
-     so don't assume only recent messages matter.
-   - **Dress code**: any uniform/dress instructions that apply tomorrow
-     (e.g. "sports day, wear house colors", "PE kit tomorrow"). Also
-     apply this fixed weekly schedule regardless of what the scraped
-     messages say (it isn't sourced from the portal/WhatsApp - it's a
-     standing fact about this child's week): swimming is every Tuesday
-     and skating is every Thursday. When today (IST) is Monday, include
-     a reminder to pack swimming dress for tomorrow. When today (IST)
-     is Wednesday, include a reminder to pack skating shoes for
-     tomorrow.
-
-     **Override rule**: if a scraped message calls out a specific dress
-     code for tomorrow (a special event, a change of plan, "no
-     swimming/skating tomorrow", etc.), that message-sourced instruction
-     wins - state that one instead of the fixed swim/skate reminder
-     above, don't just add it alongside as if both applied. Only fall
-     back to the fixed weekly swim/skate reminder when nothing in the
-     scraped messages says otherwise for that specific day.
-   - **Other reminders**: anything else worth a parent's attention (fee
-     due dates, forms to sign, items to bring, competitions, events)
-     that doesn't fit the above, **but only if its date falls within
-     the next 5 days from today (IST), inclusive of tomorrow**. If a
-     message mentions something further out than that (e.g. a
-     competition three weeks away), don't surface it yet - it'll
-     naturally get picked up on a later day's run once it's within the
-     5-day window. This keeps the brief focused on what's actually
-     actionable soon, not a running list of everything ever mentioned.
-   Omit a section entirely if there's nothing for it, rather than
-   forcing an empty slot.
-
-8. Assemble the categorization from step 7 into a single structured
-   JSON object with these exact keys:
-   - `date`: a short human-readable label for what this brief covers,
-     e.g. `"Monday, September 7, 2026"` (the date `tomorrow` refers to
-     in IST).
-   - `warnings`: list of strings, one per source that had a non-null
-     `error` (from step 5) - empty list if none.
-   - `aviraj_highlight`: a single string if a message specifically named
-     Aviraj (from the highlight rule above), otherwise `null`.
-   - `classwork`: list of strings, one per classwork item (from the
-     most recent school day, per the carry-forward rule) - empty list
-     if none.
-   - `homework`: list of strings, one per homework item (from the most
-     recent school day, per the carry-forward rule) - empty list if
-     none.
-   - `agenda`: list of strings, one per tomorrow's-agenda item - empty
-     list if none.
-   - `dress_code`: a single string (the effective dress-code instruction
-     for tomorrow, after applying the override rule above), or `null` if
-     nothing applies.
-   - `reminders`: list of strings, one per other-reminder item within the
-     5-day window - empty list if none.
-
-   Write this object as JSON to `output/daily_brief_content.json`.
-
-9. Run:
-
-   ```bash
-   python send_email.py
-   ```
-
-   This reads `output/daily_brief_content.json`, renders it into a
-   styled HTML email (see `render_email.py`), and sends it via Gmail
-   SMTP to the configured recipient (`EMAIL_TO` in `.env`). If this
-   command fails (e.g. SMTP credentials not configured, network error),
-   report the failure - don't treat it as if the brief was delivered.
+Do not read or summarize messages/PDFs yourself, write brief content manually,
+run `commit_archive.py` separately, or call `send_email.py` again. The pipeline
+already handles those steps. Do not print `.env` or API keys.

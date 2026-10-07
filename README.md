@@ -3,11 +3,12 @@
 Pulls together messages from the school web portal and (via phone-forwarded
 messages captured as email) the school WhatsApp group, and
 produces a daily brief covering homework, tomorrow's agenda, tomorrow's
-dress code, and other reminders.
+dress code, and other reminders using direct Azure OpenAI calls. Claude Code
+and agent skills are not required to run the pipeline.
 
 See `docs/superpowers/specs/2026-09-05-daily-school-brief-design.md` for the
-full design and `docs/superpowers/plans/2026-09-05-daily-school-brief.md`
-for the implementation plan and current build status.
+original design and `docs/superpowers/plans/2026-09-05-daily-school-brief.md`
+for the historical implementation plan. The current Azure workflow is below.
 
 ## Components
 
@@ -42,9 +43,15 @@ for the implementation plan and current build status.
   via `portal_archive.py`'s cutoff, WhatsApp via `cutoff.month_anchor()`),
   treating each as best-effort (one source failing doesn't block the
   other), downloads portal attachments, and writes a combined JSON
-  envelope to `output/daily_brief_input.json`.
+  envelope to `output/daily_brief_input.json`. It then calls Azure generation,
+  writes validated content, and renders/sends the email (or writes a preview).
+  The `gather()` and `run()` Python functions still support collection alone.
+- **`generate_brief.py`** - reads messages and extracts PDF text plus rendered
+  page images, calls the configured Azure OpenAI deployment with the school
+  rules, and validates the nine-field JSON output using Pydantic. Dates are
+  computed in IST by Python. PDF images preserve scans and roster/table layout.
 - **`render_email.py`** — pure function, `render_brief_html(data)`,
-  turning the skill's structured categorization (`output/daily_brief_content.json`)
+  turning Azure's validated categorization (`output/daily_brief_content.json`)
   into a polished, sectioned HTML email body. Deterministic and tested,
   so visual quality is consistent every day regardless of that day's
   content.
@@ -56,15 +63,9 @@ for the implementation plan and current build status.
   staged), and pushes `data/`, so the archive/cursor persist across
   future runs. A rejected push is reported as a printed warning, not
   raised - see its docstring.
-- The `daily-school-brief` Claude Code skill
-  (`.claude/skills/daily-school-brief/SKILL.md`) reads that envelope,
-  `Read`s any downloaded PDF attachments directly (homework/agenda/
-  dress-code details are often inside the document, not just the message
-  text), runs `commit_archive.py` so the archive/cursor persist across
-  future runs, categorizes everything into homework / tomorrow's agenda
-  / dress code / other reminders, and writes `output/daily_brief_content.json`
-  and runs `send_email.py` to send it as an HTML email. A scheduled cloud
-  routine runs this automatically each evening.
+- `.claude/skills/daily-school-brief/SKILL.md` is only a compatibility launcher
+  for older agent-based triggers. It does not interpret messages or generate
+  content. New schedules should invoke `python daily_brief.py` directly.
 
 ## Setup
 
@@ -91,6 +92,20 @@ for the implementation plan and current build status.
    `docs/PHONE_SETUP.md`) — `WHATSAPP_EMAIL_TO`.
    **Never commit `.env`** - it's already in `.gitignore`.
 
+4. Configure Azure OpenAI in `.env`:
+  ```dotenv
+  AZURE_OPENAI_ENDPOINT=https://gpt4-g11n.openai.azure.com
+  AZURE_OPENAI_DEPLOYMENT=cont-aud-gpt-6-astra
+  AZURE_OPENAI_API_VERSION=2025-04-01-preview
+  AZURE_OPENAI_API_KEY=your_actual_key
+  ```
+  Deployment is the Azure deployment name, not the model family name. It
+  must support Chat Completions, strict JSON-schema structured outputs, and
+  image input for PDFs. The API key is loaded locally and never included in
+  the prompt. Requests have a 120-second timeout and at most two SDK retries.
+  School message text and rendered PDF pages are sent to your Azure endpoint.
+  Review your organization's data-handling requirements before running.
+
 ## Run
 
 - Portal scraper only (saves messages + downloads PDFs):
@@ -101,14 +116,43 @@ for the implementation plan and current build status.
   ```
   python fetch_whatsapp.py
   ```
-- Full pipeline (writes the combined brief-input JSON, merges the portal
-  archive, downloads portal attachments):
+- Full pipeline (collects messages, generates the brief with Azure, and sends
+  the HTML email):
   ```
   python daily_brief.py
   ```
-  After running this as part of the scheduled/automated flow, `data/`
-  needs to be committed and pushed for the archive/cursor to persist —
-  see the `daily-school-brief` skill, which does this automatically.
+- Full pipeline without sending email:
+  ```
+  python daily_brief.py --preview
+  ```
+- Regenerate from saved messages/PDFs without fetching or sending email:
+  ```
+  python daily_brief.py --from-input --preview
+  ```
+- Collection only (no Azure call or email):
+  ```
+  python daily_brief.py --gather-only
+  ```
+- Generate content only from existing input:
+  ```
+  python generate_brief.py
+  ```
+- For a scheduled environment that clones the repo fresh each run:
+  ```
+  python daily_brief.py --commit-archive
+  ```
+  This explicitly commits/pushes `data/` before generation. A local persistent
+  installation retains its archive without this flag. Configure your scheduler
+  to use the project's Python environment and working directory; no Claude
+  scheduler is needed. Existing schedules are not changed automatically.
+
+If collection, archive commit, or Azure generation fails, the pipeline replaces
+old content with a warning-only brief and still attempts email/preview delivery.
+It exits nonzero after delivery so the scheduler can detect the failure. Source
+failures and unreadable PDFs appear as warnings; another source can still be
+used. Invalid JSON, refusals, and truncated completions are never sent as a
+normal brief. Empty sources skip the Azure call entirely. Oversized requests
+produce a failure warning rather than silently discarding messages or pages.
 
 ## Output
 
@@ -119,10 +163,11 @@ for the implementation plan and current build status.
 - `output/daily_brief_input.json` — combined `{"portal": {...}, "whatsapp":
   {...}}` envelope written by `daily_brief.py`, each side having
   `messages` and `error` fields. Not committed.
-- `output/daily_brief_content.json` — the skill's structured categorization
-  (`date`, `warnings`, `aviraj_highlight`, `homework`, `agenda`,
+- `output/daily_brief_content.json` — Azure's validated structured categorization
+  (`date`, `warnings`, `aviraj_highlight`, `classwork`, `homework`, `agenda`,
   `dress_code`, `reminders`), consumed by `send_email.py` to render and
   send the HTML email. Not committed.
+- `output/daily_brief_preview.html` - rendered HTML from a `--preview` run.
 - `data/portal_messages.json` — the permanent portal message archive,
   deduplicated by message id. Committed to this repo.
 - `data/last_run.json` — the portal cursor (`{"last_run": "<isoformat>"}`).

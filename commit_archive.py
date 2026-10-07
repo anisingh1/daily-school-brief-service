@@ -1,15 +1,14 @@
 """
 Commits and pushes changes under data/ (the portal message archive,
-cursor, and downloaded PDFs) - see the daily-school-brief skill,
-.claude/skills/daily-school-brief/SKILL.md step 2.
+cursor, and downloaded PDFs). The daily_brief.py pipeline calls this
+when --commit-archive is explicitly enabled.
 
-This is its own script - rather than the skill running raw git commands
-directly - so the git plumbing lives in one tested, reusable place.
+The git plumbing lives in one tested, reusable script.
 
 A push failure (e.g. a rejected non-fast-forward push because another
 run or a human pushed to data/ in between) is expected and recoverable -
-it's reported as a warning, not raised as an error, per the skill's
-guidance: it only affects whether the next run starts from today's
+it's reported as a warning, not raised as an error: it only affects
+whether the next run starts from today's
 updated archive, not today's brief. Do NOT force-push, rebase, or
 otherwise try to resolve a rejected push here.
 

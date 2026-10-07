@@ -1,10 +1,10 @@
 """
 Sends the daily school brief as an HTML email via Gmail SMTP.
 
-The skill (.claude/skills/daily-school-brief/SKILL.md) writes its
-categorized brief content to output/daily_brief_content.json; this
+generate_brief.py writes validated Azure-generated brief content to
+output/daily_brief_content.json; this
 script reads that file, renders it into HTML via render_email.py, and
-sends it - keeping "what to say" (Claude's judgment, in the skill),
+sends it - keeping "what to say" (Azure GPT's judgment),
 "how it looks" (render_email.py), and "how to send it" (this module)
 as separate concerns.
 
