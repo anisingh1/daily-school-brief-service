@@ -157,10 +157,70 @@ curl -X POST http://127.0.0.1:8000/brief
 ```
 
 This applies cleanup, reads the retained archives and cached documents, calls
-Azure for the daily brief, returns the validated eight-field JSON, and writes
+Azure for the daily brief, returns the validated ten-field JSON, and writes
 `output/daily_brief_content.json`. It never fetches new portal/WhatsApp messages
 or sends email. Missing PDF caches are prepared as needed. Initialization is
 required if no archive exists. Failures return HTTP 502 rather than stale content.
+
+The storage lock covers only the input snapshot and publication of results.
+Messages, PDF bytes, and cached document text are snapshotted together; PDF
+processing and Azure calls run outside the lock. Brief requests can generate in
+parallel while collection updates storage. Each response uses its own snapshot;
+the last request to publish becomes the saved brief. Brief content and PDF caches
+are published atomically so readers do not see partially written JSON.
+
+Calendar planners are read visually: red-background date cells are transcribed
+as explicitly dated school holidays, even without a printed holiday label.
+An explicit color legend takes precedence; unclear dates or colors produce
+warnings. Confirmed holidays suppress that day's school dress/activity packing
+instructions unless an explicit attendance instruction overrides the closure.
+PDF cache version `v3` refreshes older extractions to preserve these visual cues.
+
+Newer explicit school notices from the portal or WhatsApp override older planner
+entries for the specified dates, class, and bus route. Closure and reopening
+announcements update the holiday list. Half-day dismissal and bus pickup/drop-off
+changes appear in tomorrow's agenda or the existing five-day reminder window;
+they are not classified as full-day holidays. Relative dates in notices are
+resolved using the notice timestamp. Unresolved conflicts produce warnings.
+
+The response includes a separate `holidays` list, also saved in the brief JSON
+and rendered in the email. It contains confirmed full-day closures from today
+onward, including known planner dates beyond the reminder window. Dates are
+validated, deduplicated, and sorted; past or cancelled holidays are excluded.
+The list is rebuilt from retained sources on each generation, not maintained in
+a separate calendar file. Older saved briefs without this field remain readable.
+
+```json
+{
+  "holidays": [
+    {"date": "2026-10-09", "reason": "School closed due to rain"}
+  ]
+}
+```
+
+PDF extraction also classifies each document as `school_notice` (assembly
+schedules, monthly activity planners, weekly updates and event notices) or
+`notebook_page` (notebook, workbook or worksheet exercises). Classification is
+cached during collection; existing unclassified caches are rebuilt as needed.
+The brief's `homework_pages` contains only notebook PDFs relevant to its selected
+homework, each with `name` and `url`. Notices and unrelated older notebook pages
+are not included.
+
+```json
+{
+  "homework_pages": [
+    {"name": "Hindi worksheet.pdf", "url": "/pdfs/Hindi%20worksheet.pdf"}
+  ]
+}
+```
+
+Links always use downloaded PDFs via `GET /pdfs/{filename}` on this service.
+PDF downloads require no authentication; anyone who can reach the service and
+knows the URL can access them. Other API routes retain their authentication. Relative links are
+resolved against your service URL. Set `SERVICE_PUBLIC_URL` to your trusted,
+reachable HTTP(S) service URL to produce absolute fallback links for emails.
+Files must remain under `data/pdfs`; links stop working after retention cleanup.
+Homework-page links are also rendered in the email's Homework section.
 
 Email the saved brief to the recipients configured in `EMAIL_TO`:
 
@@ -177,8 +237,10 @@ If SMTP fails after accepting the message, delivery may be uncertain, so check
 the mailbox before retrying. Saved content and any rendered preview remain available.
 
 `GET /health` reports the schedule, next poll, retention, initialization state,
-and last scheduled collection result. A conflicting operation returns HTTP 409;
-a cron poll skips if initialization or generation is still running. Use one
+and last scheduled collection result. Its `busy` flag reports the storage lock,
+not active Azure generation. A conflicting storage operation returns HTTP 409;
+a cron poll skips while the lock is held, but not during brief generation.
+Brief publication waits for the lock before saving results. Use one
 service process/worker and do not run the standalone collection/cleanup commands
 against the same files concurrently. Shutdown waits for active scheduled work.
 For always-on operation, keep the service running under your process supervisor.
@@ -247,7 +309,7 @@ before running standalone commands against the same output files.
   preserving dates, scans, and student-to-assignment table rows. Validated
   page text is cached by SHA-256 and extraction version under `data/pdf_cache/`.
   Unchanged PDFs reuse that text without another PDF/image request. A separate
-  daily Azure call applies the school rules and validates the eight-field brief
+  daily Azure call applies the school rules and validates the ten-field brief
   using Pydantic. Dates are computed in IST by Python.
 - **`render_email.py`** — pure function, `render_brief_html(data)`,
   turning Azure's validated categorization (`output/daily_brief_content.json`)
@@ -354,7 +416,7 @@ For just the REST service and scheduler tests:
   `messages` and `error` fields. A collection snapshot and source-error metadata,
   not the authoritative message store for generation. Not committed.
 - `output/daily_brief_content.json` — Azure's validated structured categorization
-  (`date`, `warnings`, `aviraj_highlight`, `classwork`, `homework`, `agenda`,
+  (`date`, `warnings`, `aviraj_highlight`, `classwork`, `homework`, `homework_pages`, `agenda`,
   `dress_code`, `reminders`), consumed by `send_email.py` to render and
   send the HTML email. Not committed.
 - `output/daily_brief_preview.html` - rendered HTML from a `--preview` run.

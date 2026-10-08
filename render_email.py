@@ -9,11 +9,12 @@ decides what goes in the brief; this module decides how it looks.
 
 Expected `data` keys: `date` (str), `warnings` (list[str]),
 `aviraj_highlight` (str | None), `classwork` (list[str]), `homework`
-(list[str]), `agenda` (list[str]), `dress_code` (str | None),
-`reminders` (list[str]).
+(list[str]), `homework_pages` (list[dict[str, str]]), `agenda` (list[str]), `dress_code` (str | None),
+`reminders` (list[str]), `holidays` (list[dict[str, str]] with date and reason).
 """
 
 from html import escape
+from urllib.parse import urlsplit
 
 
 def _as_list(value) -> list[str]:
@@ -50,14 +51,29 @@ _COLORS = {
 }
 
 
-def _section(title: str, accent: str, items: list[str]) -> str:
+def _section(title: str, accent: str, items: list[str],
+        links: list[dict[str, str]] | None = None) -> str:
     items = [item for item in items if item and item.strip()]
-    if not items:
-        return ""
     rows = "".join(
         f'<li style="margin: 0 0 8px 0; line-height: 1.5;">{escape(item)}</li>'
         for item in items
     )
+    for link in links or []:
+        url = link.get("url", "")
+        name = link.get("name", "")
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            continue
+        is_web_url = parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+        is_pdf_path = not parsed.scheme and not parsed.netloc and parsed.path.startswith("/pdfs/")
+        if name.strip() and (is_web_url or is_pdf_path):
+            rows += (
+                '<li style="margin: 0 0 8px 0; line-height: 1.5;">'
+                f'<a href="{escape(url, quote=True)}">{escape(name)}</a></li>'
+            )
+    if not rows:
+        return ""
     return f"""
     <div style="margin: 0 0 24px 0; padding: 16px 20px; background: #FAFAFA;
                 border-left: 4px solid {accent}; border-radius: 4px;">
@@ -79,6 +95,8 @@ def render_brief_html(data: dict) -> str:
     classwork = _as_list(data.get("classwork"))
     homework = _as_list(data.get("homework"))
     agenda = _as_list(data.get("agenda"))
+    holidays = [f"{holiday['date']}: {holiday['reason']}" for holiday in data.get("holidays", [])
+                if holiday.get("date") and holiday.get("reason")]
     dress_code = data.get("dress_code")
     dress_code = dress_code if dress_code and dress_code.strip() else None
     reminders = _as_list(data.get("reminders"))
@@ -113,8 +131,9 @@ def render_brief_html(data: dict) -> str:
         warning_html,
         highlight_html,
         _section("🏫 Classwork", _COLORS["classwork_accent"], classwork),
-        _section("📚 Homework", _COLORS["homework_accent"], homework),
+        _section("📚 Homework", _COLORS["homework_accent"], homework, data.get("homework_pages")),
         _section("📅 Tomorrow's Agenda", _COLORS["agenda_accent"], agenda),
+        _section("School Holidays", _COLORS["agenda_accent"], holidays),
         dress_html,
         _section("🔔 Other Reminders", _COLORS["reminders_accent"], reminders),
     ])

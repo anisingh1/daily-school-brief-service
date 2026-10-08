@@ -5,8 +5,10 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 from secrets import compare_digest
 from threading import Lock
+from time import monotonic
 from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo
 
@@ -15,6 +17,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.base import BaseTrigger
 from croniter import croniter
 from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 import daily_brief
@@ -122,6 +125,15 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=401, detail="A valid bearer token is required",
                                 headers={"WWW-Authenticate": "Bearer"})
 
+    @application.get("/pdfs/{filename}", response_class=FileResponse)
+    def read_pdf(filename: str) -> FileResponse:
+        directory = generate_brief.PDF_DIR.resolve()
+        path = (directory / filename).resolve()
+        if path.parent != directory or path.suffix.lower() != ".pdf" or not path.is_file():
+            raise HTTPException(status_code=404, detail="PDF not found")
+        return FileResponse(path, media_type="application/pdf", filename=path.name,
+                            content_disposition_type="inline")
+
     @application.get("/health", dependencies=[Depends(authorize)])
     def health() -> dict[str, Any]:
         job = scheduler.get_job("collect_messages")
@@ -177,21 +189,37 @@ def create_app() -> FastAPI:
     @application.post("/brief", response_model=generate_brief.BriefContent,
                       dependencies=[Depends(authorize)])
     def prepare_brief() -> generate_brief.BriefContent:
-        if not operation_lock.acquire(blocking=False):
-            raise HTTPException(status_code=409, detail="Another storage operation is running; retry later")
+        started = monotonic()
+        LOGGER.info("POST /brief received")
         try:
-            if not portal_archive.ARCHIVE_PATH.exists() and not portal_archive.WHATSAPP_ARCHIVE_PATH.exists():
-                raise HTTPException(status_code=409, detail="Initialize storage first with POST /initialize")
-            now = datetime.now(portal_archive.IST)
-            return generate_brief.run(now=now)
+            if not operation_lock.acquire(blocking=False):
+                LOGGER.info("POST /brief rejected: another storage operation is running")
+                raise HTTPException(status_code=409, detail="Another storage operation is running; retry later")
+            try:
+                if not portal_archive.ARCHIVE_PATH.exists() and not portal_archive.WHATSAPP_ARCHIVE_PATH.exists():
+                    raise HTTPException(status_code=409, detail="Initialize storage first with POST /initialize")
+                now = datetime.now(portal_archive.IST)
+                LOGGER.info("POST /brief snapshotting stored messages and PDFs")
+                data = generate_brief.load_stored_input(now)
+                pdf_snapshot = generate_brief.snapshot_pdfs(data)
+            finally:
+                operation_lock.release()
+            LOGGER.info("POST /brief generating outside storage lock")
+            cache_writes: dict[Path, dict[str, Any]] = {}
+            content = generate_brief.generate(data, now=now, pdf_snapshot=pdf_snapshot,
+                                             cache_writes=cache_writes)
+            LOGGER.info("POST /brief publishing content and PDF caches")
+            with operation_lock:
+                for path, cached_document in cache_writes.items():
+                    portal_archive.write_json(path, cached_document)
+                generate_brief.write_content(content)
+            LOGGER.info("POST /brief completed in %.2fs", monotonic() - started)
+            return content
         except HTTPException:
             raise
         except Exception as error:
-            LOGGER.error("Stored-data brief generation failed (%s)", type(error).__name__)
+            LOGGER.exception("POST /brief failed after %.2fs (%s)", monotonic() - started, type(error).__name__)
             raise HTTPException(status_code=502, detail=f"Brief generation failed ({type(error).__name__})") from error
-        finally:
-            operation_lock.release()
-
     @application.post("/email-brief", dependencies=[Depends(authorize)])
     def email_brief() -> dict[str, str]:
         if not operation_lock.acquire(blocking=False):
@@ -217,6 +245,8 @@ app = create_app()
 
 
 def run() -> None:
+    logging.basicConfig(level=os.getenv("SERVICE_LOG_LEVEL", "INFO").upper(),
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     host = os.getenv("SERVICE_HOST", "127.0.0.1")
     if host not in {"127.0.0.1", "localhost", "::1"} and not os.getenv("SERVICE_API_TOKEN", "").strip():
         raise ValueError("Set SERVICE_API_TOKEN before binding outside localhost")

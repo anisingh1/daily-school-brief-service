@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from threading import Barrier, Event
 from types import SimpleNamespace
 
 import pytest
@@ -38,6 +40,34 @@ def test_favicon_returns_no_content_without_authentication(monkeypatch):
     assert response.status_code == 204
     assert response.content == b""
     assert "/favicon.ico" not in application.openapi()["paths"]
+
+
+def test_pdf_links_serve_saved_files_without_authentication(tmp_path, monkeypatch):
+    monkeypatch.setenv("SERVICE_API_TOKEN", "test-token")
+    monkeypatch.setattr(service.generate_brief, "PDF_DIR", tmp_path / "pdfs")
+    service.generate_brief.PDF_DIR.mkdir()
+    path = service.generate_brief.PDF_DIR / "Hindi worksheet.pdf"
+    path.write_bytes(b"%PDF-1.4\n")
+    test_client = TestClient(service.create_app())
+    assert test_client.get("/health").status_code == 401
+    response = test_client.get("/pdfs/Hindi%20worksheet.pdf")
+    assert response.status_code == 200
+    assert response.content == path.read_bytes()
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.headers["content-disposition"].startswith("inline;")
+
+
+@pytest.mark.parametrize("filename", ["missing.pdf", "notice.txt", "outside.pdf"])
+def test_pdf_links_reject_missing_non_pdf_and_symlink_files(client, tmp_path, monkeypatch, filename):
+    directory = tmp_path / "pdfs"
+    directory.mkdir()
+    (directory / "notice.txt").write_text("Not a PDF")
+    outside = tmp_path / "private.pdf"
+    outside.write_bytes(b"%PDF-1.4\n")
+    (directory / "outside.pdf").symlink_to(outside)
+    monkeypatch.setattr(service.generate_brief, "PDF_DIR", directory)
+    assert client.get(f"/pdfs/{filename}").status_code == 404
+    assert client.get("/pdfs/%2E%2E%2Fprivate.pdf").status_code == 404
 
 
 def test_scheduler_uses_env_cron_and_shuts_down(client):
@@ -256,10 +286,14 @@ def test_brief_uses_stored_archives_without_fetching_or_sending(client, monkeypa
     service.portal_archive.save_archive([message])
     calls = []
 
-    def generate(data, now):
+    def generate(data, now, **kwargs):
+        assert not client.app.state.operation_lock.locked()
         calls.append(data)
         content = service.generate_brief.empty_brief("date", [])
         content.homework = ["Read page 12"]
+        content.holidays = [service.generate_brief.Holiday.model_validate_json(
+            '{"date": "2026-10-09", "reason": "School closure notice"}',
+        )]
         return content
 
     monkeypatch.setattr(service.generate_brief, "generate", generate)
@@ -267,8 +301,54 @@ def test_brief_uses_stored_archives_without_fetching_or_sending(client, monkeypa
     response = client.post("/brief")
     assert response.status_code == 200
     assert response.json()["homework"] == ["Read page 12"]
+    assert response.json()["holidays"] == [{"date": "2026-10-09", "reason": "School closure notice"}]
     assert calls[0]["portal"]["messages"] == [message]
     assert service.generate_brief.CONTENT_PATH.exists()
+    saved = service.generate_brief.BriefContent.model_validate_json(
+        service.generate_brief.CONTENT_PATH.read_text(encoding="utf-8"),
+    )
+    assert saved.model_dump(mode="json")["holidays"] == response.json()["holidays"]
+
+
+def test_briefs_generate_in_parallel_while_poll_updates_storage(client, monkeypatch):
+    timestamp = datetime.now(service.portal_archive.IST).isoformat()
+    original = {"id": "old", "posted_at": timestamp, "body": "Old homework", "attachments": []}
+    updated = {"id": "new", "posted_at": timestamp, "body": "New homework", "attachments": []}
+    service.portal_archive.save_archive([original])
+    first_started = Event()
+    parallel_generation = Barrier(2)
+
+    def generate(data, now, **kwargs):
+        assert not client.app.state.operation_lock.locked()
+        first_started.set()
+        parallel_generation.wait(timeout=5)
+        content = service.generate_brief.empty_brief("date", [])
+        content.homework = [data["portal"]["messages"][0]["body"]]
+        return content
+
+    def collect():
+        service.portal_archive.save_archive([updated])
+        return {"portal": {"messages": [updated], "error": None}}
+
+    monkeypatch.setattr(service.generate_brief, "generate", generate)
+    monkeypatch.setattr(service.daily_brief, "run", collect)
+    monkeypatch.setattr(service, "prepare_storage", lambda data: {"messages": {"portal": 1}})
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(client.post, "/brief")
+        assert first_started.wait(timeout=5)
+        assert client.get("/health").json()["busy"] is False
+        client.app.state.scheduler.get_job("collect_messages").func()
+        assert client.get("/health").json()["last_poll"]["messages"] == {"portal": 1}
+        second = client.post("/brief")
+        first_response = first.result(timeout=5)
+    assert first_response.status_code == second.status_code == 200
+    assert first_response.json()["homework"] == ["Old homework"]
+    assert second.json()["homework"] == ["New homework"]
+    saved = service.generate_brief.BriefContent.model_validate_json(
+        service.generate_brief.CONTENT_PATH.read_text(encoding="utf-8"),
+    )
+    assert saved.homework in (["Old homework"], ["New homework"])
+    assert not client.app.state.operation_lock.locked()
 
 
 def test_initialization_collects_all_and_prepares_json_without_brief(client, monkeypatch):
@@ -302,7 +382,7 @@ def test_poll_updates_both_archives_and_brief_reads_latest_storage(client, monke
         "portal": {"messages": [], "error": None}, "whatsapp": {"messages": [], "error": None},
     })
 
-    def generate(data, now):
+    def generate(data, now, **kwargs):
         assert data["portal"]["messages"] == [portal]
         assert data["whatsapp"]["messages"] == [whatsapp]
         content = service.generate_brief.empty_brief("date", [])
