@@ -5,7 +5,6 @@ def _base_data(**overrides):
     data = {
         "date": "2026-09-05",
         "warnings": [],
-        "aviraj_highlight": None,
         "homework": [],
         "agenda": [],
         "dress_code": None,
@@ -67,16 +66,25 @@ def test_render_shows_nothing_new_message_when_all_empty():
     assert "Nothing new" in html
 
 
-def test_render_includes_warnings_banner():
+def test_render_omits_warnings_banner():
     html = render_brief_html(_base_data(warnings=["WhatsApp fetch failed"]))
-    assert "WhatsApp fetch failed" in html
+    assert "WhatsApp fetch failed" not in html
+    assert "Heads up" not in html
 
 
-def test_render_includes_aviraj_highlight():
+def test_render_moves_legacy_highlight_to_reminders():
     html = render_brief_html(
         _base_data(aviraj_highlight="Aviraj is presenting show and tell tomorrow")
     )
     assert "Aviraj is presenting show and tell tomorrow" in html
+    assert "Other Reminders" in html
+    assert "⭐" not in html
+
+
+def test_render_deduplicates_legacy_highlight_in_reminders():
+    reminder = "Aviraj is presenting show and tell tomorrow"
+    html = render_brief_html(_base_data(aviraj_highlight=reminder, reminders=[reminder]))
+    assert html.count(reminder) == 1
 
 
 def test_render_includes_dress_code_section_when_present():

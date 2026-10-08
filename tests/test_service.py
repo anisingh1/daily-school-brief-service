@@ -299,7 +299,7 @@ def test_brief_reads_saved_content_without_fetching_generating_or_sending(client
         for request in (client.get, client.post):
             response = request("/brief")
             assert response.status_code == 200
-            assert response.json() == content.model_dump(mode="json")
+            assert response.json() == content.model_dump(mode="json", exclude={"warnings"})
 
 
 def test_saved_brief_reads_remain_available_during_refresh(client, monkeypatch):
@@ -349,15 +349,45 @@ def test_saved_brief_reads_remain_available_during_refresh(client, monkeypatch):
     assert not client.app.state.operation_lock.locked()
 
 
+def test_saved_legacy_highlight_is_returned_as_reminder(client):
+    content = service.generate_brief.empty_brief("date", []).model_dump(mode="json")
+    content["aviraj_highlight"] = "Aviraj: bring an assembly prop tomorrow"
+    service.portal_archive.write_json(service.generate_brief.CONTENT_PATH, content)
+    for request in (client.get, client.post):
+        response = request("/brief")
+        assert response.status_code == 200
+        assert "aviraj_highlight" not in response.json()
+        assert response.json()["reminders"] == [content["aviraj_highlight"]]
+
+
 def test_initialization_collects_all_and_prepares_json_without_brief(client, monkeypatch):
     calls = []
     data = {"portal": {"messages": [], "error": None}, "whatsapp": {"messages": [], "error": None}}
     monkeypatch.setattr(service.daily_brief, "run", lambda initialize: calls.append(initialize) or data)
-    monkeypatch.setattr(service, "prepare_storage", lambda data: {"messages": {"portal": 0, "whatsapp": 0}, "pdf_documents": 0, "warnings": []})
+    monkeypatch.setattr(service, "prepare_storage", lambda data: {
+        "messages": {"portal": 0, "whatsapp": 0}, "pdf_documents": 0,
+        "warnings": ["Initialization warning"],
+    })
     monkeypatch.setattr(service.generate_brief, "generate", lambda **kwargs: pytest.fail("Unexpected brief generation"))
     response = client.post("/initialize")
     assert response.status_code == 200
+    assert response.json()["warnings"] == ["Initialization warning"]
     assert calls == [True]
+
+
+@pytest.mark.parametrize(("endpoint", "source"), [
+    ("/scrape-udt", "portal"), ("/fetch-whatsapp", "whatsapp"),
+])
+def test_source_collection_responses_omit_warnings(client, monkeypatch, endpoint, source):
+    monkeypatch.setattr(service.daily_brief, "run", lambda **kwargs: {
+        source: {"messages": [], "error": None},
+    })
+    monkeypatch.setattr(service, "prepare_storage", lambda data: {
+        "messages": {source: 0}, "pdf_documents": 0, "warnings": ["PDF warning"],
+    })
+    response = client.post(endpoint)
+    assert response.status_code == 200
+    assert response.json() == {"messages": {source: 0}, "pdf_documents": 0}
 
 
 def test_poll_updates_both_archives_and_brief_reads_latest_storage(client, monkeypatch):
@@ -395,15 +425,17 @@ def test_poll_updates_both_archives_and_brief_reads_latest_storage(client, monke
 
 
 @pytest.mark.parametrize("manual", [False, True])
-def test_cron_and_refresh_collect_cache_generate_and_save(client, monkeypatch, manual):
+def test_cron_and_refresh_collect_cache_generate_and_save(client, monkeypatch, manual, caplog):
     calls = []
     data = {"portal": {"messages": [], "error": None}}
     monkeypatch.setattr(service.daily_brief, "run", lambda: calls.append("collect") or data)
-    monkeypatch.setattr(service, "prepare_storage", lambda data: calls.append("cache") or {"messages": {"portal": 0}})
+    monkeypatch.setattr(service, "prepare_storage", lambda data: calls.append("cache") or {
+        "messages": {"portal": 0}, "warnings": ["Collection warning"],
+    })
     def generate(collected, now):
         assert collected == data
         calls.append("generate")
-        content = service.generate_brief.empty_brief("date", [])
+        content = service.generate_brief.empty_brief("date", ["Collection warning", "Generation warning"])
         content.homework = ["Generated homework"]
         return content
 
@@ -412,11 +444,18 @@ def test_cron_and_refresh_collect_cache_generate_and_save(client, monkeypatch, m
         response = client.post("/refresh")
         assert response.status_code == 200
         assert response.json()["brief_generated"] is True
+        assert response.json()["warnings"] == ["Collection warning", "Generation warning"]
+        assert "Scheduled brief warning" not in caplog.text
     else:
         client.app.state.scheduler.get_job("collect_messages").func()
+        assert "Scheduled brief warning: Collection warning" in caplog.text
+        assert "Scheduled brief warning: Generation warning" in caplog.text
     assert calls == ["collect", "cache", "generate"]
     assert client.get("/brief").json()["homework"] == ["Generated homework"]
+    assert "warnings" not in client.get("/brief").json()
+    assert "warnings" not in client.post("/brief").json()
     assert client.get("/health").json()["last_poll"]["messages"] == {"portal": 0}
+    assert "warnings" not in client.get("/health").json()["last_poll"]
 
 
 def test_busy_operations_are_rejected_and_polls_skip(client, monkeypatch):
@@ -524,7 +563,7 @@ def test_failed_refresh_preserves_previous_brief_and_reports_failure(client, mon
         assert "sensitive" not in response.text
     else:
         client.app.state.scheduler.get_job("collect_messages").func()
-    assert client.get("/brief").json() == content.model_dump(mode="json")
+    assert client.get("/brief").json() == content.model_dump(mode="json", exclude={"warnings"})
     assert client.get("/health").json()["last_poll"]["error"] == "RuntimeError"
     assert client.get("/health").json()["last_poll"]["brief_generated"] is False
     assert not client.app.state.operation_lock.locked()

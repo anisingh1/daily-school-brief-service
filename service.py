@@ -87,13 +87,14 @@ def create_app() -> FastAPI:
             data = daily_brief.run()
             summary = prepare_storage(data)
             LOGGER.info("Collection completed; generating saved brief")
-            generate_brief.run(data=data, now=datetime.now(portal_archive.IST))
+            content = generate_brief.run(data=data, now=datetime.now(portal_archive.IST))
+            warnings = list(dict.fromkeys(summary.pop("warnings", []) + content.warnings))
             application.state.last_poll = {
                 "at": format_poll_time(datetime.now(timezone)), **summary,
                 "brief_generated": True, "duration_seconds": round(monotonic() - started, 2),
             }
             LOGGER.info("Collection and brief generation completed in %.2fs", monotonic() - started)
-            return application.state.last_poll
+            return {**application.state.last_poll, "warnings": warnings}
         except Exception as error:
             application.state.last_poll = {
                 "at": format_poll_time(datetime.now(timezone)), "error": type(error).__name__,
@@ -106,7 +107,9 @@ def create_app() -> FastAPI:
 
     def poll_messages() -> None:
         try:
-            collect_and_generate()
+            result = collect_and_generate()
+            for warning in result["warnings"]:
+                LOGGER.warning("Scheduled brief warning: %s", warning)
         except HTTPException as error:
             if error.status_code == 409:
                 LOGGER.info("Skipping collection while another storage operation is running")
@@ -181,7 +184,9 @@ def create_app() -> FastAPI:
             data = daily_brief.run(source=source)
             if data[source].get("error"):
                 raise HTTPException(status_code=502, detail=f"{source} collection failed; cursor was not advanced")
-            return prepare_storage({source: data[source]})
+            summary = prepare_storage({source: data[source]})
+            summary.pop("warnings", None)
+            return summary
         except HTTPException:
             raise
         except Exception as error:
@@ -203,12 +208,14 @@ def create_app() -> FastAPI:
         return collect_and_generate()
 
     @application.get("/brief", response_model=generate_brief.BriefContent,
+                     response_model_exclude={"warnings"},
                      dependencies=[Depends(authorize)])
     @application.post("/brief", response_model=generate_brief.BriefContent,
+                      response_model_exclude={"warnings"},
                       dependencies=[Depends(authorize)])
     def read_brief() -> generate_brief.BriefContent:
         try:
-            return generate_brief.BriefContent.model_validate_json(
+            return generate_brief.validate_brief_content(
                 generate_brief.CONTENT_PATH.read_text(encoding="utf-8"),
             )
         except FileNotFoundError as error:
@@ -224,7 +231,7 @@ def create_app() -> FastAPI:
         try:
             if not send_email.CONTENT_PATH.exists():
                 raise HTTPException(status_code=409, detail="Generate a brief first with POST /refresh")
-            generate_brief.BriefContent.model_validate_json(send_email.CONTENT_PATH.read_text(encoding="utf-8"))
+            generate_brief.validate_brief_content(send_email.CONTENT_PATH.read_text(encoding="utf-8"))
             send_email.run()
             return {"status": "sent"}
         except HTTPException:

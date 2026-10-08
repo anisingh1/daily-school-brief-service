@@ -11,6 +11,20 @@ import generate_brief
 import portal_archive
 
 
+@pytest.mark.parametrize("highlight", [None, "", "   ", "Aviraj: bring an assembly prop tomorrow"])
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_legacy_highlight_moves_to_reminders_and_leaves_schema(highlight, duplicate):
+    reminder = "Aviraj: bring an assembly prop tomorrow"
+    payload = generate_brief.empty_brief("date", []).model_dump()
+    payload["aviraj_highlight"] = highlight
+    payload["reminders"] = [reminder] if duplicate else []
+    content = generate_brief.validate_brief_content(json.dumps(payload))
+    assert content.reminders == ([reminder] if duplicate or highlight == reminder else [])
+    assert "aviraj_highlight" not in content.model_dump()
+    assert "aviraj_highlight" not in generate_brief.BriefContent.model_json_schema()["properties"]
+    assert payload["aviraj_highlight"] == highlight
+
+
 @pytest.mark.parametrize("cached", [False, True])
 def test_pdf_snapshot_survives_source_and_cache_cleanup(tmp_path, monkeypatch, cached):
     monkeypatch.setattr(generate_brief, "ROOT", tmp_path)
@@ -76,8 +90,22 @@ def test_dates_use_ist_even_when_utc_is_previous_day():
     assert context["include_today_dress_code_reminders"] is True
     assert context["tomorrow_ist"] == "2026-10-08"
     assert context["tomorrow_weekday"] == "Thursday"
-    assert context["reminders_through_ist"] == "2026-10-12"
+    assert context["reminders_through_ist"] == "2026-10-21"
     assert context["brief_date"] == "Thursday, October 8, 2026"
+
+
+@pytest.mark.parametrize(("today", "through"), [
+    ("2026-10-08", "2026-10-22"),
+    ("2026-10-25", "2026-11-08"),
+    ("2026-12-25", "2027-01-08"),
+    ("2028-02-20", "2028-03-05"),
+])
+def test_reminder_window_spans_next_fourteen_days(today, through):
+    context = generate_brief.date_context(datetime.fromisoformat(today).replace(tzinfo=generate_brief.IST))
+    assert context["reminders_through_ist"] == through
+    assert "between tomorrow_ist and reminders_through_ist" in generate_brief.SYSTEM_PROMPT
+    assert "(today plus 14 days), inclusive" in generate_brief.SYSTEM_PROMPT
+    assert "Include all applicable upcoming events" in generate_brief.SYSTEM_PROMPT
 
 
 @pytest.mark.parametrize(("hour", "minute", "second", "include_today"), [
@@ -199,7 +227,7 @@ def test_calendar_normalization_retains_month_events_and_clears_future_assignmen
         }
         prompt = kwargs["messages"][0]["content"]
         assert "covering the entire current IST month" in prompt
-        assert "beyond the five-day window" in prompt
+        assert "beyond the 14-day window" in prompt
         assert "Do not carry the daily summary's latest homework" in prompt
         return SimpleNamespace(choices=[SimpleNamespace(
             finish_reason="stop", message=SimpleNamespace(refusal=None, content=json.dumps(raw)),
@@ -249,7 +277,9 @@ def test_holiday_dates_must_be_real_iso_dates(invalid_date):
 def test_generation_sorts_deduplicates_and_filters_holidays(monkeypatch):
     raw = generate_brief.empty_brief("date", []).model_dump(mode="json")
     raw["holidays"] = [
-        {"date": "2026-11-01", "reason": "Planner holiday beyond reminder window"},
+        {"date": "2026-11-02", "reason": "Planner holiday beyond reminder window"},
+        {"date": "2026-10-10", "reason": "Saturday closure"},
+        {"date": "2026-10-11", "reason": "Sunday holiday"},
         {"date": "2026-10-09", "reason": "Planner holiday"},
         {"date": "2026-10-07", "reason": "Past holiday"},
         {"date": "2026-10-08", "reason": "Today's holiday"},
@@ -257,6 +287,10 @@ def test_generation_sorts_deduplicates_and_filters_holidays(monkeypatch):
     ]
 
     def create(**kwargs):
+        prompt = kwargs["messages"][0]["content"]
+        assert "Sundays are always regular school holidays" in prompt
+        assert "Do not add reminders solely announcing Saturday or Sunday school holidays" in prompt
+        assert "Preserve genuine" in prompt
         schema = kwargs["response_format"]["json_schema"]["schema"]
         assert "holidays" in schema["required"]
         assert schema["$defs"]["Holiday"]["required"] == ["date", "reason"]
@@ -273,8 +307,29 @@ def test_generation_sorts_deduplicates_and_filters_holidays(monkeypatch):
     assert [holiday.model_dump(mode="json") for holiday in content.holidays] == [
         {"date": "2026-10-08", "reason": "Today's holiday"},
         {"date": "2026-10-09", "reason": "Updated closure notice"},
-        {"date": "2026-11-01", "reason": "Planner holiday beyond reminder window"},
+        {"date": "2026-11-02", "reason": "Planner holiday beyond reminder window"},
     ]
+
+
+def test_calendar_omits_weekend_holidays_but_keeps_real_weekend_reminders():
+    content = generate_brief.empty_brief("date", [])
+    for day in ("2026-10-09", "2026-10-10", "2026-10-11"):
+        holiday = generate_brief.Holiday.model_validate_json(json.dumps({
+            "date": day, "reason": "School holiday",
+        }))
+        content.holidays.append(holiday)
+        content.calendar.append(generate_brief.CalendarDay(
+            date=holiday.date, classwork=[], homework=[], homework_pages=[],
+            agenda=[], reminders=["Submit the project online"], holidays=[holiday],
+        ))
+    days = {day.date.isoformat(): day for day in generate_brief.normalize_calendar(
+        content, datetime(2026, 10, 8).date(), {},
+    )}
+    assert [holiday.date.isoformat() for holiday in content.holidays] == ["2026-10-09"]
+    assert len(days["2026-10-09"].holidays) == 1
+    for day in ("2026-10-10", "2026-10-11"):
+        assert days[day].holidays == []
+        assert days[day].reminders == ["Submit the project online"]
 
 
 @pytest.mark.parametrize("notice, agenda, holidays", [
@@ -313,6 +368,51 @@ def test_urgent_notice_prompt_and_response_contract(monkeypatch, notice, agenda,
     content = generate_brief.generate(data, now=datetime(2026, 10, 8, 12, tzinfo=generate_brief.IST))
     assert content.agenda == [agenda]
     assert [holiday.model_dump(mode="json") for holiday in content.holidays] == holidays
+
+
+@pytest.mark.parametrize(("notice", "reminders"), [
+    ("For the October 15 art event, send two coloured sheets and glue on October 14.",
+     ["October 14: Send two coloured sheets and glue for the October 15 art event."]),
+    ("Pay INR 500 via the school portal by October 12 at 17:00 for the November 4 trip.",
+     ["October 12, 17:00: Pay INR 500 via the school portal for the November 4 trip."]),
+    ("Submit the signed consent form to the class teacher by October 13 for the November 4 trip.",
+     ["October 13: Submit the signed consent form to the class teacher for the November 4 trip."]),
+    ("Send a labelled water bottle for the October 15 trip. No submission deadline is given.",
+     ["Send a labelled water bottle for the October 15 trip. Deadline not specified."]),
+    ("Please submit the signed photo consent form to the class teacher.",
+     ["Submit the signed photo consent form to the class teacher. Deadline not specified."]),
+    ("Aviraj's trip fee has been paid and consent submitted. No further action is required.", []),
+])
+def test_parent_action_reminder_prompt_and_response_contract(monkeypatch, notice, reminders):
+    data = {"portal": {"messages": [{"posted_at": "2026-10-08T10:00:00+05:30", "body": notice}]}}
+
+    def create(**kwargs):
+        prompt = kwargs["messages"][0]["content"]
+        for rule in (
+            "items to send or bring to school", "fees", "consent or permission forms",
+            "payment amount and currency", "payment or submission method",
+            "required signatures or documents", "deadline date/time",
+            "Use the action deadline, not just the event date",
+            "include an action due within the reminder window even if its event is later",
+            "Deadline not specified", "requests posted within the last 14 days",
+            "Do not invent missing amounts, methods, or dates",
+            "Do not assume a request is unpaid", "Omit actions explicitly completed",
+            "omit undated actions from dated calendar entries",
+        ):
+            assert rule in prompt
+        payload = json.loads(kwargs["messages"][1]["content"][0]["text"])
+        assert payload["sources"] == data
+        assert payload["reminders_through_ist"] == "2026-10-22"
+        content = generate_brief.empty_brief("date", [])
+        content.reminders = reminders
+        return SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="stop", message=SimpleNamespace(refusal=None, content=content.model_dump_json()),
+        )])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)), close=lambda: None)
+    monkeypatch.setattr(generate_brief, "create_client", lambda: (client, "deployment"))
+    content = generate_brief.generate(data, now=datetime(2026, 10, 8, 12, tzinfo=generate_brief.IST))
+    assert content.reminders == reminders
 
 
 def test_schema_rejects_wrong_types_and_extra_keys():
@@ -561,10 +661,24 @@ def test_pdf_links_always_use_encoded_service_url(monkeypatch, source_url, base_
     assert generate_brief.pdf_link(path, {"source_url": source_url}) == expected
 
 
-def test_brief_keeps_only_known_notebook_links(monkeypatch):
+@pytest.mark.parametrize(("message_date", "include_classwork"), [
+    ("2026-10-08T14:17:00", True),
+    ("2026-10-07T20:00:00+00:00", True),
+    ("2026-10-08T20:00:00+00:00", False),
+    ("2026-10-07T14:17:00", False),
+    ("2026-10-09T14:17:00", False),
+    (None, False),
+    ("invalid", False),
+])
+def test_brief_keeps_only_known_notebook_links(monkeypatch, message_date, include_classwork):
     documents = [
         {"category": "notebook_page", "name": "Hindi.pdf", "url": "https://school.example/hindi.pdf"},
-        {"category": "school_notice", "name": "Assembly.pdf", "url": "https://school.example/assembly.pdf"},
+        {"category": "school_notice", "name": "Assembly.pdf", "url": "https://school.example/assembly.pdf",
+         "message_date": "2026-10-08T14:17:00"},
+        {"category": "notebook_page", "name": "Math.pdf", "url": "/pdfs/Math.pdf",
+         "message_date": message_date},
+        {"category": "notebook_page", "name": "Math.pdf", "url": "/pdfs/Math.pdf",
+         "message_date": message_date},
     ]
     monkeypatch.setattr(generate_brief, "prepare_input", lambda *_args, **_kwargs: (
         {"brief_date": "Friday, October 9, 2026", "today_ist": "2026-10-08", "documents": documents}, [], [],
@@ -585,7 +699,7 @@ def test_brief_keeps_only_known_notebook_links(monkeypatch):
     result = generate_brief.generate({"portal": {"messages": [{"body": "Homework"}]}})
     assert [page.model_dump() for page in result.homework_pages] == [
         {"name": "Hindi.pdf", "url": "https://school.example/hindi.pdf"},
-    ]
+    ] + ([{"name": "Math.pdf", "url": "/pdfs/Math.pdf"}] if include_classwork else [])
     assert result.warnings == ["An unsupported homework PDF link was omitted."]
     schema = client.chat.completions.create.call_args.kwargs["response_format"]["json_schema"]["schema"]
     assert "homework_pages" in schema["required"]

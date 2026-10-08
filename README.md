@@ -152,7 +152,7 @@ Each endpoint fetches messages strictly newer than that source's last successful
 collection start time, bounded by the configured lookback window. Without a
 saved cursor, it uses that window directly. Messages and attachments are saved locally and PDF caches are prepared;
 neither endpoint generates a brief or sends email. The response includes retained
-message counts, PDF document counts, and warnings. The other source is not fetched.
+message counts and PDF document counts. The other source is not fetched.
 Cursors advance only after successful fetching and archive persistence, so failed
 fetches or archive writes can be retried. `POST /initialize` bypasses both cursors
 to backfill storage. All collection routes share the scheduler's storage lock.
@@ -170,6 +170,11 @@ sends email. Without initialized storage, collection uses the configured
 lookback window. Failures return HTTP 502; overlapping storage operations return
 HTTP 409. This endpoint can take as long as the scheduled workflow.
 
+Warnings are exposed only in `/initialize` and `/refresh` responses, not in
+`/brief`, `/health`, or rendered emails. Refresh warnings include both collection
+and brief-generation warnings. Scheduled runs log each warning at WARNING level;
+saved content retains warnings for internal diagnostics.
+
 Read the saved brief without collection, cleanup, or LLM calls:
 
 ```bash
@@ -178,7 +183,7 @@ curl http://127.0.0.1:8000/brief
 curl -X POST http://127.0.0.1:8000/brief
 ```
 
-Both methods return the validated eleven-field JSON. Missing content returns
+Both methods return the validated brief JSON without internal warnings. Missing content returns
 HTTP 409 with a prompt to run `POST /refresh`; invalid content returns HTTP 502.
 The storage lock covers the complete refresh workflow, preventing overlapping
 collection or generation. Brief reads do not acquire this lock and can return
@@ -190,6 +195,10 @@ as explicitly dated school holidays, even without a printed holiday label.
 An explicit color legend takes precedence; unclear dates or colors produce
 warnings. Confirmed holidays suppress that day's school dress/activity packing
 instructions unless an explicit attendance instruction overrides the closure.
+Saturdays and Sundays are always regular school holidays and are omitted from
+the daily and calendar `holidays` lists, even when explicitly marked in a notice.
+The generation prompt also omits reminders announcing weekend holidays, while
+preserving genuine weekend assignments, deadlines, and events.
 PDF cache version `v3` refreshes older extractions to preserve these visual cues.
 
 For a date-selecting frontend, use the response's `calendar` array. It contains
@@ -197,7 +206,7 @@ one ISO-dated entry for every day of the current month in IST, in date order,
 including days with no known content. Each entry has `date`, `classwork`,
 `homework`, `homework_pages`, `agenda`, `reminders`, and `holidays`.
 Agenda, reminders, and holidays include known planner/notice facts throughout
-the month, not just tomorrow or the next five days. Reminders are attached to
+the month, not just tomorrow or the next 14 days. Reminders are attached to
 the date an action is required. Notice overrides are resolved per affected date.
 Homework, classwork, and homework PDF links are tied to their actual school
 dates; Python always clears these fields on future dates. Unknown content stays
@@ -222,7 +231,8 @@ Example calendar entry (the actual array contains every date in the month):
 ```
 
 The top-level fields retain their daily-summary behavior, including tomorrow's
-agenda and the five-day reminder window; the calendar is the monthly frontend
+agenda and the 14-day reminder window (tomorrow through today plus 14 days,
+inclusive); the calendar is the monthly frontend
 view. It is saved with the brief JSON but is not expanded into the daily email.
 Older saved briefs without `calendar` remain readable. The frontend should cache
 older months itself: this response covers the current month using retained
@@ -232,9 +242,19 @@ alone does not preserve the PDF file after cleanup.
 Newer explicit school notices from the portal or WhatsApp override older planner
 entries for the specified dates, class, and bus route. Closure and reopening
 announcements update the holiday list. Half-day dismissal and bus pickup/drop-off
-changes appear in tomorrow's agenda or the existing five-day reminder window;
+changes appear in tomorrow's agenda or the 14-day reminder window;
 they are not classified as full-day holidays. Relative dates in notices are
 resolved using the notice timestamp. Unresolved conflicts produce warnings.
+
+Reminders explicitly cover items to send to school, fee payments, and consent
+or permission requests, preserving supplied quantities, amounts/currency,
+submission methods, recipients, required documents, and deadline dates/times.
+Actions due within the 14-day window are included even when their event is later;
+action deadlines and event dates remain distinct. Recent applicable requests
+without deadlines are marked "Deadline not specified", without inventing a date
+or assuming a payment or consent is outstanding. Explicitly completed, cancelled,
+superseded, and expired actions are omitted. Dated calendar reminders use the
+action deadline; undated requests are not assigned an invented calendar date.
 
 The response includes a separate `holidays` list, also saved in the brief JSON
 and rendered in the email. It contains confirmed full-day closures from today
@@ -255,9 +275,11 @@ PDF extraction also classifies each document as `school_notice` (assembly
 schedules, monthly activity planners, weekly updates and event notices) or
 `notebook_page` (notebook, workbook or worksheet exercises). Classification is
 cached during collection; existing unclassified caches are rebuilt as needed.
-The brief's `homework_pages` contains only notebook PDFs relevant to its selected
-homework, each with `name` and `url`. Notices and unrelated older notebook pages
-are not included.
+The brief's `homework_pages` contains all `notebook_page` PDFs sent today in IST,
+including classwork and homework, plus older notebook PDFs relevant to its selected
+homework. Today's links are included even if the model omits them. Each PDF appears
+once with its exact `name` and `url`; school notices and unrelated older notebook
+pages are not included. The field name is retained for API compatibility.
 
 ```json
 {
@@ -362,7 +384,7 @@ before running standalone commands against the same output files.
   preserving dates, scans, and student-to-assignment table rows. Validated
   page text is cached by SHA-256 and extraction version under `data/pdf_cache/`.
   Unchanged PDFs reuse that text without another PDF/image request. A separate
-  daily Azure call applies the school rules and validates the eleven-field brief
+  daily Azure call applies the school rules and validates the structured brief
   using Pydantic. Dates are computed in IST by Python.
 - **`render_email.py`** — pure function, `render_brief_html(data)`,
   turning Azure's validated categorization (`output/daily_brief_content.json`)
@@ -469,10 +491,13 @@ For just the REST service and scheduler tests:
   `messages` and `error` fields. A collection snapshot and source-error metadata,
   not the authoritative message store for generation. Not committed.
 - `output/daily_brief_content.json` — Azure's validated structured categorization
-  (`date`, `warnings`, `aviraj_highlight`, `classwork`, `homework`, `homework_pages`, `agenda`,
+  (`date`, `warnings`, `classwork`, `homework`, `homework_pages`, `agenda`,
   `dress_code`, `reminders`), consumed by `send_email.py` to render and
   send the HTML email. Not committed.
 - `output/daily_brief_preview.html` - rendered HTML from a `--preview` run.
+- Aviraj-specific notices and assignments appear in `reminders`, not in a
+  separate highlight section. Legacy saved highlights are moved into reminders
+  when read or rendered, without duplicating identical reminder text.
 - `data/portal_messages.json` - the rolling 35-day portal message archive,
   deduplicated by message id. Stored locally, ignored by Git.
 - `data/whatsapp_messages.json` - the rolling 35-day captured WhatsApp message
