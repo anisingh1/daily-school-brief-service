@@ -15,8 +15,8 @@ versions; the current workflow and run instructions are below.
 
 1. Start the REST service and call `POST /initialize` to populate local storage.
 2. The in-process cron scheduler collects messages on the configured schedule.
-  Portal collection uses the last successful fetch cursor; WhatsApp collection
-  uses the retention window. Both sources are merged into local JSON archives.
+  Each source uses its own last successful fetch cursor, with the retention
+  window as the first-run fallback. Both sources are merged into local JSON archives.
 3. Missing PDFs are downloaded. New or changed PDFs are transcribed with Azure
   using extracted text and page images. Full-page transcriptions are cached by
   file hash and extraction version, so unchanged PDFs are not uploaded again.
@@ -25,11 +25,18 @@ versions; the current workflow and run instructions are below.
 5. Call `POST /brief` to generate today's brief from stored messages and cached
   PDF text. Azure applies the school rules; Python validates the JSON output
   and saves it locally. This endpoint does not collect messages or send email.
-6. Optionally render a preview or send the saved brief with `send_email.py`.
+6. Call `POST /email-brief` to email the saved brief to the configured recipients.
+  For a local HTML preview without delivery, run `send_email.py --preview`
+  only while the service is stopped.
 
 Storage is local files, not a database. No Claude runtime, agent framework,
 OS cron job, or automatic Git commit is needed. Keep `data/` persistent and run
 one service process against it.
+
+The REST workflow separates collection, generation, and delivery. Running
+`daily_brief.py` directly still performs all three steps in one command using
+the same shared implementations. It is an alternative to the service, not a
+second process to run alongside it against the same files.
 
 ## Build And Setup
 
@@ -110,11 +117,32 @@ The portal currently exposes one activity page; unavailable historical messages
 cannot be recovered by this endpoint. PDF transcription uses the configured Azure
 deployment and may take time on the initial scan.
 
-At each cron tick, the service fetches new portal messages using the cursor,
-refreshes retained WhatsApp messages, stores text/PDFs, prepares PDF caches,
+At each cron tick, the service fetches new portal and WhatsApp messages using
+their separate cursors, stores text/PDFs, prepares PDF caches,
 and applies cleanup. It does not automatically generate or email a brief.
 Collection errors are visible in `GET /health` and retained data stays usable.
 Starting the service does not immediately fetch or initialize storage.
+`POST /brief` always reads the latest retained archives, not a previously
+generated brief or an old input snapshot. Freshness is bounded by the last
+successful cron collection. Use the source collection endpoints before `/brief`
+when you need an immediate refresh between scheduled polls. If collection fails,
+the brief uses retained messages with a warning rather than claiming fresh data.
+
+Collect just one source on demand:
+
+```bash
+curl -X POST http://127.0.0.1:8000/scrape-udt
+curl -X POST http://127.0.0.1:8000/fetch-whatsapp
+```
+
+Each endpoint fetches messages strictly newer than that source's last successful
+collection start time. Without a saved cursor, it uses the configured retention
+window. Messages and attachments are saved locally and PDF caches are prepared;
+neither endpoint generates a brief or sends email. The response includes retained
+message counts, PDF document counts, and warnings. The other source is not fetched.
+Cursors advance only after successful fetching and archive persistence, so failed
+fetches or archive writes can be retried. `POST /initialize` bypasses both cursors
+to backfill storage. All collection routes share the scheduler's storage lock.
 
 Generate and return a brief from stored data on demand:
 
@@ -127,6 +155,20 @@ Azure for the daily brief, returns the validated eight-field JSON, and writes
 `output/daily_brief_content.json`. It never fetches new portal/WhatsApp messages
 or sends email. Missing PDF caches are prepared as needed. Initialization is
 required if no archive exists. Failures return HTTP 502 rather than stale content.
+
+Email the saved brief to the recipients configured in `EMAIL_TO`:
+
+```bash
+curl -X POST http://127.0.0.1:8000/email-brief
+```
+
+This validates and renders the saved content, writes the HTML preview, and sends
+it through the existing SMTP configuration. It does not fetch messages or call
+Azure. Success returns `{"status": "sent"}`; missing content returns HTTP 409
+with a prompt to call `POST /brief`, and validation or delivery failures return
+HTTP 502. Each successful call sends an email; there are no automatic retries.
+If SMTP fails after accepting the message, delivery may be uncertain, so check
+the mailbox before retrying. Saved content and any rendered preview remain available.
 
 `GET /health` reports the schedule, next poll, retention, initialization state,
 and last scheduled collection result. A conflicting operation returns HTTP 409;
@@ -157,8 +199,8 @@ To preview or email the saved brief after `POST /brief`:
 ```
 
 The preview is written to `output/daily_brief_preview.html`. These commands
-reuse saved content without another Azure generation request. Wait for any
-active service operation to finish before accessing the same output files.
+reuse saved content without another Azure generation request. Stop the service
+before running standalone commands against the same output files.
 
 ## Components
 
@@ -174,26 +216,26 @@ active service operation to finish before accessing the same output files.
   forwarded via phone automation as email (see `docs/PHONE_SETUP.md`),
   via IMAP using the same Gmail App Password as `send_email.py` (no
   Google Cloud project or service account), filtered to the same
-  rolling lookback window (standalone) or the configured retention cutoff
-  (35 days by default). PDF attachments are saved to `data/pdfs/`
+  rolling lookback window (standalone) or its saved cursor in the service,
+  falling back to retention on first use (35 days by default). PDF attachments are saved to `data/pdfs/`
   (prefixed `whatsapp_`); other attachment types are ignored.
-- **`cutoff.py`** - legacy month-anchor helper; the daily pipeline now uses
-  the configured retention window instead.
 - **`portal_archive.py`** - persists portal and WhatsApp message archives
-  as local JSON, plus the portal's last successful fetch cursor. New portal
-  messages are fetched since the cursor, or within retention on first use.
+  as local JSON, plus each source's last successful fetch cursor. New
+  messages are fetched since their cursor, or within retention on first use.
   WhatsApp messages are deduplicated by their captured message content.
   Both archives, PDFs, extracted PDF text, and saved outputs are cleaned up
   locally without a database.
 - **`daily_brief.py`** — orchestrator that calls both fetchers (portal
-  via `portal_archive.py`'s cursor, WhatsApp via the retention cutoff),
+  via their independent `portal_archive.py` cursors),
   treating each as best-effort (one source failing doesn't block the
   other), downloads portal attachments, and writes a combined JSON
   envelope to `output/daily_brief_input.json`. It then calls Azure generation,
   writes validated content, and renders/sends the email (or writes a preview).
   The `gather()` and `run()` Python functions still support collection alone.
 - **`service.py`** - long-running cron collection plus REST endpoints for
-  storage initialization, stored-data brief generation, and service health.
+  initialization, independent source collection, stored-data brief generation,
+  email delivery, and service health. Scheduling and endpoints reuse the same
+  collection, generation, rendering, and SMTP implementations as the CLI.
 - **`generate_brief.py`** - reads stored messages and PDFs. New or changed
   PDFs are transcribed by Azure using extracted text and rendered page images,
   preserving dates, scans, and student-to-assignment table rows. Validated
@@ -210,10 +252,6 @@ active service operation to finish before accessing the same output files.
   it via `render_email.py`, and sends it as an HTML email via Gmail SMTP.
   `python send_email.py --preview` skips SMTP and writes
   `output/daily_brief_preview.html` instead, for local dry runs.
-- **`commit_archive.py`** — stages, commits (only if there's something
-  staged), and pushes `data/`, so the archive/cursor persist across
-  future runs. A rejected push is reported as a printed warning, not
-  raised - see its docstring.
 - `.claude/skills/daily-school-brief/SKILL.md` is only a compatibility launcher
   for older agent-based triggers. It does not interpret messages or generate
   content. New schedules should invoke `python daily_brief.py` directly.
@@ -242,36 +280,34 @@ pipeline use their explicit cursor and retention cutoffs instead.
   ```
   .venv/bin/python daily_brief.py --preview
   ```
-- Regenerate from saved messages/PDFs without fetching or sending email:
+- Regenerate from the latest stored archives/PDFs without fetching or sending email:
   ```
   .venv/bin/python daily_brief.py --from-input --preview
   ```
+  Despite the legacy flag name, messages come from the retained archives, not
+  the message snapshot in `output/daily_brief_input.json`. The saved input is
+  consulted only for source-error metadata.
 - Collection only (no Azure call or email):
   ```
   .venv/bin/python daily_brief.py --gather-only
   ```
-- Generate content only from existing input:
+- Generate content only from the latest stored archives:
   ```
   .venv/bin/python generate_brief.py
   ```
-- For a scheduled environment that clones the repo fresh each run:
-  ```
-  .venv/bin/python daily_brief.py --commit-archive
-  ```
-  This explicitly commits/pushes `data/` after generation, including any PDF
-  caches created during generation, even if generation fails. A local persistent
-  installation retains its archive without this flag. Configure your scheduler
-  to use the project's Python environment and working directory; no Claude
-  scheduler is needed. Existing schedules are not changed automatically.
+- The obsolete `--commit-archive` option and Git-publishing helper have been
+  removed. Store `data/` on persistent local storage or a mounted volume; school
+  data is ignored by Git. Historical design documents describe the retired
+  fresh-clone workflow, not the current runtime.
 
 - Cleanup only, without downloading, calling Azure, or sending email:
   ```
   .venv/bin/python portal_archive.py
   ```
   Cleanup also runs before and after normal collection and before `--from-input`.
-  Stored input is filtered to the retention window before reuse.
+  Generation reads the cleaned, retained archives.
 
-If collection, archive commit, or Azure generation fails, the pipeline replaces
+If collection raises an unrecoverable error or Azure generation fails, the pipeline replaces
 old content with a warning-only brief and still attempts email/preview delivery.
 It exits nonzero after delivery so the scheduler can detect the failure. Source
 failures and unreadable PDFs appear as warnings; another source can still be
@@ -309,24 +345,25 @@ For just the REST service and scheduler tests:
   (gitignored, under `output/`).
 - `output/daily_brief_input.json` — combined `{"portal": {...}, "whatsapp":
   {...}}` envelope written by `daily_brief.py`, each side having
-  `messages` and `error` fields. Not committed.
+  `messages` and `error` fields. A collection snapshot and source-error metadata,
+  not the authoritative message store for generation. Not committed.
 - `output/daily_brief_content.json` — Azure's validated structured categorization
   (`date`, `warnings`, `aviraj_highlight`, `classwork`, `homework`, `agenda`,
   `dress_code`, `reminders`), consumed by `send_email.py` to render and
   send the HTML email. Not committed.
 - `output/daily_brief_preview.html` - rendered HTML from a `--preview` run.
 - `data/portal_messages.json` - the rolling 35-day portal message archive,
-  deduplicated by message id. Committed to this repo.
+  deduplicated by message id. Stored locally, ignored by Git.
 - `data/whatsapp_messages.json` - the rolling 35-day captured WhatsApp message
-  archive, including text and saved PDF references. Committed with `data/`.
+  archive, including text and saved PDF references. Stored locally, ignored by Git.
 - `data/pdf_cache/` - validated full-page PDF transcriptions, keyed by content
   hash and extraction version. Corrupt entries are rebuilt on the next use.
-- `data/last_run.json` — the portal cursor (`{"last_run": "<isoformat>"}`).
-  Committed to this repo.
+- `data/last_run.json` — independent successful collection timestamps under
+  `last_run` (portal) and `whatsapp_last_run`. Stored locally, ignored by Git.
 - `data/pdfs/` — downloaded PDF (or other) attachments, named using the
   message ID and their display name in the portal (prefixed `whatsapp_`
-  for ones from the WhatsApp document capture instead). Committed to
-  this repo; a file already present here is not re-downloaded.
+  for ones from the WhatsApp document capture instead). Stored locally and
+  ignored by Git; a file already present here is not re-downloaded.
 
 ## Notes
 

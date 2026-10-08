@@ -32,6 +32,53 @@ def isolated_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(portal_archive, "OUTPUT_DIR", tmp_path / "output")
 
 
+@pytest.mark.parametrize("source", ["portal", "whatsapp"])
+def test_source_collection_uses_own_cursor_only(source, monkeypatch):
+    from datetime import datetime, timedelta
+
+    previous = datetime.now(portal_archive.IST).replace(tzinfo=None) - timedelta(hours=1)
+    portal_archive.save_last_run(previous)
+    portal_archive.save_whatsapp_last_run(previous)
+    calls = []
+
+    def fetch(**kwargs):
+        calls.append(kwargs["cutoff"])
+        return []
+
+    def unexpected_fetch(**kwargs):
+        pytest.fail("Other source must not be fetched")
+
+    monkeypatch.setattr(daily_brief, "fetch_recent_messages", fetch if source == "portal" else unexpected_fetch)
+    monkeypatch.setattr(daily_brief, "fetch_recent_whatsapp_messages", fetch if source == "whatsapp" else unexpected_fetch)
+    result = daily_brief.gather(source=source)
+    expected = previous + timedelta(microseconds=1)
+    if source == "whatsapp":
+        expected = expected.replace(tzinfo=portal_archive.IST)
+    assert calls == [expected]
+    assert result[source]["error"] is None
+    if source == "portal":
+        assert portal_archive.read_last_run() > previous
+        assert portal_archive.read_whatsapp_last_run() == previous
+    else:
+        assert portal_archive.read_whatsapp_last_run() > previous
+        assert portal_archive.read_last_run() == previous
+
+
+def test_whatsapp_failure_preserves_cursor(monkeypatch):
+    from datetime import datetime
+
+    previous = datetime(2026, 10, 8, 10)
+    portal_archive.save_whatsapp_last_run(previous)
+
+    def failing_fetch(**kwargs):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(daily_brief, "fetch_recent_whatsapp_messages", failing_fetch)
+    result = daily_brief.gather(source="whatsapp")
+    assert result["whatsapp"]["error"] == "RuntimeError: offline"
+    assert portal_archive.read_whatsapp_last_run() == previous
+
+
 def test_gather_captures_portal_error(monkeypatch):
     def failing_fetch(**kwargs):
         raise RuntimeError("login failed")
@@ -246,6 +293,7 @@ def test_pipeline_generates_writes_and_previews(monkeypatch, tmp_path, from_inpu
     input_path = tmp_path / "input.json"
     input_path.write_text(json.dumps(data))
     monkeypatch.setattr(daily_brief, "OUTPUT_PATH", input_path)
+    monkeypatch.setattr(daily_brief.generate_brief, "load_stored_input", lambda now: data)
     monkeypatch.setattr(daily_brief.generate_brief, "CONTENT_PATH", tmp_path / "content.json")
     calls = []
     def collect():
@@ -259,13 +307,12 @@ def test_pipeline_generates_writes_and_previews(monkeypatch, tmp_path, from_inpu
     monkeypatch.setattr(daily_brief, "run", collect)
     monkeypatch.setattr(daily_brief.generate_brief, "generate", generate)
     monkeypatch.setattr(daily_brief.send_email, "run", lambda preview: calls.append(("send", preview)))
-    monkeypatch.setattr(daily_brief.commit_archive, "commit_and_push", lambda: pytest.fail("Unexpected commit"))
     assert daily_brief.run_pipeline(preview=True, from_input=from_input)
     assert calls == (["generate", ("send", True)] if from_input else ["collect", "generate", ("send", True)])
     assert json.loads((tmp_path / "content.json").read_text())["homework"] == []
 
 
-@pytest.mark.parametrize("stage", ["collect", "generate", "archive"])
+@pytest.mark.parametrize("stage", ["collect", "generate"])
 def test_pipeline_replaces_stale_content_with_warning_and_still_delivers(monkeypatch, tmp_path, stage):
     content_path = tmp_path / "content.json"
     content_path.write_text('{"homework": ["stale"]}')
@@ -275,10 +322,9 @@ def test_pipeline_replaces_stale_content_with_warning_and_still_delivers(monkeyp
         raise RuntimeError("sensitive detail that should not be emailed")
     monkeypatch.setattr(daily_brief, "run", fail if stage == "collect" else lambda: data)
     monkeypatch.setattr(daily_brief.generate_brief, "generate", fail if stage == "generate" else lambda *args, **kwargs: daily_brief.generate_brief.empty_brief("date", []))
-    monkeypatch.setattr(daily_brief.commit_archive, "commit_and_push", fail if stage == "archive" else lambda: pytest.fail("Unexpected commit"))
     sent = []
     monkeypatch.setattr(daily_brief.send_email, "run", lambda preview: sent.append(preview))
-    assert not daily_brief.run_pipeline(persist_archive=stage == "archive")
+    assert not daily_brief.run_pipeline()
     result = json.loads(content_path.read_text())
     assert result["homework"] == []
     assert "RuntimeError" in result["warnings"][-1]
@@ -286,31 +332,3 @@ def test_pipeline_replaces_stale_content_with_warning_and_still_delivers(monkeyp
     assert sent == [False]
 
 
-def test_pipeline_includes_recoverable_archive_warning(monkeypatch, tmp_path):
-    monkeypatch.setattr(daily_brief.generate_brief, "CONTENT_PATH", tmp_path / "content.json")
-    monkeypatch.setattr(daily_brief, "run", lambda: {})
-    monkeypatch.setattr(daily_brief.commit_archive, "commit_and_push", lambda: print("WARNING: push rejected"))
-    monkeypatch.setattr(daily_brief.generate_brief, "generate", lambda *args, **kwargs: daily_brief.generate_brief.empty_brief("date", []))
-    monkeypatch.setattr(daily_brief.send_email, "run", lambda preview: None)
-    assert daily_brief.run_pipeline(preview=True, persist_archive=True)
-    result = json.loads((tmp_path / "content.json").read_text())
-    assert "could not be pushed" in result["warnings"][0]
-
-
-@pytest.mark.parametrize("generation_fails", [False, True])
-def test_archive_commit_runs_after_generation_even_on_failure(monkeypatch, tmp_path, generation_fails):
-    monkeypatch.setattr(daily_brief.generate_brief, "CONTENT_PATH", tmp_path / "content.json")
-    monkeypatch.setattr(daily_brief, "run", lambda: {})
-    calls = []
-
-    def generate(*args, **kwargs):
-        calls.append("generate")
-        if generation_fails:
-            raise RuntimeError("failed")
-        return daily_brief.generate_brief.empty_brief("date", [])
-
-    monkeypatch.setattr(daily_brief.generate_brief, "generate", generate)
-    monkeypatch.setattr(daily_brief.commit_archive, "commit_and_push", lambda: calls.append("commit"))
-    monkeypatch.setattr(daily_brief.send_email, "run", lambda preview: calls.append("send"))
-    assert daily_brief.run_pipeline(persist_archive=True) is not generation_fails
-    assert calls == ["generate", "commit", "send"]

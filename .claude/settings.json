@@ -4,7 +4,6 @@
     "allow": [
       "Bash(python daily_brief.py:*)",
       "Bash(python send_email.py:*)",
-      "Bash(python commit_archive.py:*)",
       "Bash(git diff:*)",
       "Bash(tail:*)",
       "Bash(cat:*)",

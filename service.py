@@ -1,14 +1,13 @@
 """Scheduled collection and REST access to the file-based school brief."""
 
 import asyncio
-import json
 import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from secrets import compare_digest
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 import uvicorn
@@ -21,6 +20,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import daily_brief
 import generate_brief
 import portal_archive
+import send_email
 
 LOGGER = logging.getLogger(__name__)
 
@@ -139,6 +139,30 @@ def create_app() -> FastAPI:
         finally:
             operation_lock.release()
 
+    def collect_source(source: Literal["portal", "whatsapp"]) -> dict[str, Any]:
+        if not operation_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="Another storage operation is running; retry later")
+        try:
+            data = daily_brief.run(source=source)
+            if data[source].get("error"):
+                raise HTTPException(status_code=502, detail=f"{source} collection failed; cursor was not advanced")
+            return prepare_storage({source: data[source]})
+        except HTTPException:
+            raise
+        except Exception as error:
+            LOGGER.error("%s collection failed (%s)", source, type(error).__name__)
+            raise HTTPException(status_code=502, detail=f"Collection failed ({type(error).__name__})") from error
+        finally:
+            operation_lock.release()
+
+    @application.post("/scrape-udt", dependencies=[Depends(authorize)])
+    def scrape_udt() -> dict[str, Any]:
+        return collect_source("portal")
+
+    @application.post("/fetch-whatsapp", dependencies=[Depends(authorize)])
+    def fetch_whatsapp() -> dict[str, Any]:
+        return collect_source("whatsapp")
+
     @application.post("/brief", response_model=generate_brief.BriefContent,
                       dependencies=[Depends(authorize)])
     def prepare_brief() -> generate_brief.BriefContent:
@@ -148,18 +172,30 @@ def create_app() -> FastAPI:
             if not portal_archive.ARCHIVE_PATH.exists() and not portal_archive.WHATSAPP_ARCHIVE_PATH.exists():
                 raise HTTPException(status_code=409, detail="Initialize storage first with POST /initialize")
             now = datetime.now(portal_archive.IST)
-            archives = portal_archive.cleanup_stored_data(now)
-            saved_input = json.loads(daily_brief.OUTPUT_PATH.read_text(encoding="utf-8")) if daily_brief.OUTPUT_PATH.exists() else {}
-            data = {name: {"messages": messages, "error": saved_input.get(name, {}).get("error")}
-                    for name, messages in archives.items()}
-            content = generate_brief.generate(data, now=now)
-            generate_brief.write_content(content)
-            return content
+            return generate_brief.run(now=now)
         except HTTPException:
             raise
         except Exception as error:
             LOGGER.error("Stored-data brief generation failed (%s)", type(error).__name__)
             raise HTTPException(status_code=502, detail=f"Brief generation failed ({type(error).__name__})") from error
+        finally:
+            operation_lock.release()
+
+    @application.post("/email-brief", dependencies=[Depends(authorize)])
+    def email_brief() -> dict[str, str]:
+        if not operation_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="Another storage operation is running; retry later")
+        try:
+            if not send_email.CONTENT_PATH.exists():
+                raise HTTPException(status_code=409, detail="Generate a brief first with POST /brief")
+            generate_brief.BriefContent.model_validate_json(send_email.CONTENT_PATH.read_text(encoding="utf-8"))
+            send_email.run()
+            return {"status": "sent"}
+        except HTTPException:
+            raise
+        except Exception as error:
+            LOGGER.error("Email delivery failed (%s)", type(error).__name__)
+            raise HTTPException(status_code=502, detail=f"Email delivery failed ({type(error).__name__})") from error
         finally:
             operation_lock.release()
 

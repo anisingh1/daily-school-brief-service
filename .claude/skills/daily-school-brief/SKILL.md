@@ -18,17 +18,13 @@ The application can also run directly without this skill or Claude Code.
    python daily_brief.py
    ```
 
-   For a scheduled environment that clones the repository fresh each run,
-   preserve the archive with:
-
-   ```bash
-   python daily_brief.py --commit-archive
-   ```
+   Keep `data/` on persistent storage; school data is not published to Git.
+   Stop the REST service before using the CLI against the same storage.
 
    If the user explicitly requests a preview without email, add `--preview`.
 3. Report the command result. A nonzero exit can mean a warning-only email was
    delivered after generation failed; do not claim a normal brief succeeded.
 
 Do not read or summarize messages/PDFs yourself, write brief content manually,
-run `commit_archive.py` separately, or call `send_email.py` again. The pipeline
+or call `send_email.py` again. The pipeline
 already handles those steps. Do not print `.env` or API keys.

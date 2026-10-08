@@ -278,10 +278,21 @@ def write_content(content: BriefContent) -> None:
     CONTENT_PATH.write_text(content.model_dump_json(indent=2), encoding="utf-8")
 
 
-def run() -> BriefContent:
-    cleanup_stored_data()
-    data = json.loads(INPUT_PATH.read_text(encoding="utf-8"))
-    content = generate(data)
+def load_stored_input(now: datetime | None = None) -> dict[str, Any]:
+    archives = cleanup_stored_data(now)
+    saved_input = json.loads(INPUT_PATH.read_text(encoding="utf-8")) if INPUT_PATH.exists() else {}
+    return {
+        name: {"messages": messages, "error": saved_input.get(name, {}).get("error")}
+        for name, messages in archives.items()
+    }
+
+
+def run(data: dict[str, Any] | None = None, now: datetime | None = None) -> BriefContent:
+    if now is None:
+        now = datetime.now(IST)
+    if data is None:
+        data = load_stored_input(now)
+    content = generate(data, now=now)
     write_content(content)
     print(f"Wrote {CONTENT_PATH}")
     return content

@@ -37,7 +37,22 @@ def read_last_run() -> datetime | None:
 
 
 def save_last_run(dt: datetime) -> None:
-    write_json(LAST_RUN_PATH, {"last_run": dt.isoformat()})
+    data = json.loads(LAST_RUN_PATH.read_text()) if LAST_RUN_PATH.exists() else {}
+    data["last_run"] = dt.isoformat()
+    write_json(LAST_RUN_PATH, data)
+
+
+def read_whatsapp_last_run() -> datetime | None:
+    if not LAST_RUN_PATH.exists():
+        return None
+    raw = json.loads(LAST_RUN_PATH.read_text()).get("whatsapp_last_run")
+    return dateparser.parse(raw) if raw else None
+
+
+def save_whatsapp_last_run(dt: datetime) -> None:
+    data = json.loads(LAST_RUN_PATH.read_text()) if LAST_RUN_PATH.exists() else {}
+    data["whatsapp_last_run"] = dt.isoformat()
+    write_json(LAST_RUN_PATH, data)
 
 
 def compute_portal_cutoff() -> datetime:

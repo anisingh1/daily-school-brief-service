@@ -18,7 +18,11 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(service.portal_archive, "LAST_RUN_PATH", tmp_path / "data" / "last_run.json")
     monkeypatch.setattr(service.portal_archive, "OUTPUT_DIR", tmp_path / "output")
     monkeypatch.setattr(service.daily_brief, "OUTPUT_PATH", tmp_path / "output" / "daily_brief_input.json")
+    monkeypatch.setattr(service.generate_brief, "INPUT_PATH", service.daily_brief.OUTPUT_PATH)
     monkeypatch.setattr(service.generate_brief, "CONTENT_PATH", tmp_path / "output" / "daily_brief_content.json")
+    monkeypatch.setattr(service.send_email, "CONTENT_PATH", service.generate_brief.CONTENT_PATH)
+    monkeypatch.setattr(service.send_email, "PREVIEW_PATH", tmp_path / "output" / "daily_brief_preview.html")
+    monkeypatch.setattr(service.send_email, "send_brief_email", lambda *args: pytest.fail("Unexpected SMTP delivery"))
     monkeypatch.setattr(service.daily_brief, "fetch_recent_messages", lambda **kwargs: pytest.fail("Unexpected portal fetch"))
     monkeypatch.setattr(service.daily_brief, "fetch_recent_whatsapp_messages", lambda **kwargs: pytest.fail("Unexpected IMAP fetch"))
     monkeypatch.setattr(service.generate_brief, "create_client", lambda: pytest.fail("Unexpected Azure call"))
@@ -38,6 +42,154 @@ def test_scheduler_uses_env_cron_and_shuts_down(client):
     assert result["cron"] == "0 18 * * *"
     assert result["timezone"] == "Asia/Kolkata"
     assert not result["initialized"]
+
+
+@pytest.mark.parametrize(("route", "source"), [("/scrape-udt", "portal"), ("/fetch-whatsapp", "whatsapp")])
+def test_source_endpoint_fetches_incrementally(client, monkeypatch, route, source):
+    from datetime import timedelta
+
+    previous = datetime.now(service.portal_archive.IST).replace(tzinfo=None) - timedelta(hours=1)
+    service.portal_archive.save_last_run(previous)
+    service.portal_archive.save_whatsapp_last_run(previous)
+    calls = []
+
+    def fetch(**kwargs):
+        calls.append(kwargs["cutoff"])
+        return []
+
+    fetch_name = "fetch_recent_messages" if source == "portal" else "fetch_recent_whatsapp_messages"
+    monkeypatch.setattr(service.daily_brief, fetch_name, fetch)
+    service.portal_archive.write_json(service.daily_brief.OUTPUT_PATH, {
+        "portal": {"messages": [], "error": "previous portal failure"},
+        "whatsapp": {"messages": [], "error": "previous whatsapp failure"},
+    })
+    response = client.post(route)
+    assert response.status_code == 200
+    assert response.json()["messages"] == {source: 0}
+    expected = previous + timedelta(microseconds=1)
+    if source == "whatsapp":
+        expected = expected.replace(tzinfo=service.portal_archive.IST)
+    assert calls == [expected]
+    last_run = service.portal_archive.read_last_run if source == "portal" else service.portal_archive.read_whatsapp_last_run
+    successful_run = last_run()
+    assert successful_run > previous
+    assert client.post(route).status_code == 200
+    expected = successful_run + timedelta(microseconds=1)
+    if source == "whatsapp":
+        expected = expected.replace(tzinfo=service.portal_archive.IST)
+    assert calls[1] == expected
+    assert service.daily_brief.OUTPUT_PATH.exists()
+    import json
+
+    saved = json.loads(service.daily_brief.OUTPUT_PATH.read_text())
+    other_source = "whatsapp" if source == "portal" else "portal"
+    assert saved[source]["error"] is None
+    assert saved[other_source]["error"] == f"previous {other_source} failure"
+
+
+@pytest.mark.parametrize(("route", "source"), [("/scrape-udt", "portal"), ("/fetch-whatsapp", "whatsapp")])
+def test_source_endpoint_first_run_uses_retention(client, monkeypatch, route, source):
+    cutoff = datetime(2026, 10, 8, 10)
+    monkeypatch.setattr(service.portal_archive, "retention_cutoff", lambda *args: cutoff)
+    calls = []
+
+    def fetch(**kwargs):
+        calls.append(kwargs["cutoff"])
+        return []
+
+    fetch_name = "fetch_recent_messages" if source == "portal" else "fetch_recent_whatsapp_messages"
+    monkeypatch.setattr(service.daily_brief, fetch_name, fetch)
+    assert client.post(route).status_code == 200
+    expected = cutoff if source == "portal" else cutoff.replace(tzinfo=service.portal_archive.IST)
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize(("route", "source"), [("/scrape-udt", "portal"), ("/fetch-whatsapp", "whatsapp")])
+def test_source_archive_failure_preserves_cursor(client, monkeypatch, route, source):
+    previous = datetime(2026, 10, 8, 10)
+    service.portal_archive.save_last_run(previous)
+    service.portal_archive.save_whatsapp_last_run(previous)
+    fetch_name = "fetch_recent_messages" if source == "portal" else "fetch_recent_whatsapp_messages"
+    monkeypatch.setattr(service.daily_brief, fetch_name, lambda **kwargs: [])
+
+    def fail_save(*args):
+        raise OSError("storage unavailable")
+
+    monkeypatch.setattr(service.daily_brief, "save_archive", fail_save)
+    monkeypatch.setattr(service.portal_archive, "save_archive", fail_save)
+    assert client.post(route).status_code == 502
+    assert service.portal_archive.read_last_run() == previous
+    assert service.portal_archive.read_whatsapp_last_run() == previous
+
+
+@pytest.mark.parametrize(("route", "source"), [("/scrape-udt", "portal"), ("/fetch-whatsapp", "whatsapp")])
+def test_source_endpoint_failure_preserves_cursor(client, monkeypatch, route, source):
+    previous = datetime(2026, 10, 8, 10)
+    service.portal_archive.save_last_run(previous)
+    service.portal_archive.save_whatsapp_last_run(previous)
+
+    def fetch(**kwargs):
+        raise RuntimeError("sensitive credential")
+
+    fetch_name = "fetch_recent_messages" if source == "portal" else "fetch_recent_whatsapp_messages"
+    monkeypatch.setattr(service.daily_brief, fetch_name, fetch)
+    response = client.post(route)
+    assert response.status_code == 502
+    assert "sensitive" not in response.text
+    assert service.portal_archive.read_last_run() == previous
+    assert service.portal_archive.read_whatsapp_last_run() == previous
+    assert not client.app.state.operation_lock.locked()
+
+
+def test_email_requires_saved_brief(client):
+    response = client.post("/email-brief")
+    assert response.status_code == 409
+    assert "POST /brief" in response.json()["detail"]
+    assert not client.app.state.operation_lock.locked()
+
+
+def test_email_sends_saved_brief_without_generation(client, monkeypatch):
+    content = service.generate_brief.empty_brief("08 October 2026", [])
+    content.homework = ["Read page 12"]
+    service.generate_brief.write_content(content)
+    calls = []
+    monkeypatch.setattr(service.send_email, "send_brief_email", lambda subject, html: calls.append((subject, html)))
+    monkeypatch.setattr(service.generate_brief, "generate", lambda **kwargs: pytest.fail("Unexpected brief generation"))
+    response = client.post("/email-brief")
+    assert response.status_code == 200
+    assert response.json() == {"status": "sent"}
+    assert len(calls) == 1
+    assert calls[0][0] == "Daily School Brief - 08 October 2026"
+    assert "Read page 12" in calls[0][1]
+    assert service.send_email.PREVIEW_PATH.read_text() == calls[0][1]
+    assert not client.app.state.operation_lock.locked()
+
+
+@pytest.mark.parametrize("content", ["not json", '{"date": "missing fields"}'])
+def test_email_rejects_invalid_saved_content(client, content):
+    path = service.send_email.CONTENT_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    assert client.post("/email-brief").status_code == 502
+    assert not client.app.state.operation_lock.locked()
+
+
+def test_email_failure_preserves_preview_and_releases_lock(client, monkeypatch):
+    service.generate_brief.write_content(service.generate_brief.empty_brief("08 October 2026", []))
+    calls = []
+
+    def fail_delivery(*args):
+        calls.append(args)
+        raise RuntimeError("sensitive SMTP details")
+
+    monkeypatch.setattr(service.send_email, "send_brief_email", fail_delivery)
+    response = client.post("/email-brief")
+    assert response.status_code == 502
+    assert "sensitive" not in response.text
+    assert len(calls) == 1
+    assert service.send_email.PREVIEW_PATH.exists()
+    assert service.send_email.CONTENT_PATH.exists()
+    assert not client.app.state.operation_lock.locked()
 
 
 def test_brief_requires_storage(client):
@@ -78,6 +230,41 @@ def test_initialization_collects_all_and_prepares_json_without_brief(client, mon
     assert calls == [True]
 
 
+def test_poll_updates_both_archives_and_brief_reads_latest_storage(client, monkeypatch):
+    timestamp = datetime.now(service.portal_archive.IST).replace(tzinfo=None).isoformat()
+    portal = {"id": "new-portal", "posted_at": timestamp, "body": "New homework", "attachments": []}
+    whatsapp = {"timestamp": timestamp, "text": "New notice", "attachments": []}
+    monkeypatch.setattr(service.daily_brief, "fetch_recent_messages", lambda **kwargs: [portal])
+    monkeypatch.setattr(service.daily_brief, "fetch_recent_whatsapp_messages", lambda **kwargs: [whatsapp])
+    prepared = []
+    monkeypatch.setattr(service, "prepare_storage", lambda data: prepared.append(data) or {
+        "messages": {name: len(source["messages"]) for name, source in data.items()},
+    })
+    client.app.state.scheduler.get_job("collect_messages").func()
+    assert prepared[0]["portal"]["messages"] == [portal]
+    assert prepared[0]["whatsapp"]["messages"] == [whatsapp]
+    assert service.portal_archive.read_last_run() is not None
+    assert service.portal_archive.read_whatsapp_last_run() is not None
+    assert client.get("/health").json()["last_poll"]["messages"] == {"portal": 1, "whatsapp": 1}
+    service.portal_archive.write_json(service.daily_brief.OUTPUT_PATH, {
+        "portal": {"messages": [], "error": None}, "whatsapp": {"messages": [], "error": None},
+    })
+
+    def generate(data, now):
+        assert data["portal"]["messages"] == [portal]
+        assert data["whatsapp"]["messages"] == [whatsapp]
+        content = service.generate_brief.empty_brief("date", [])
+        content.homework = ["New homework"]
+        content.reminders = ["New notice"]
+        return content
+
+    monkeypatch.setattr(service.generate_brief, "generate", generate)
+    response = client.post("/brief")
+    assert response.status_code == 200
+    assert response.json()["homework"] == ["New homework"]
+    assert response.json()["reminders"] == ["New notice"]
+
+
 def test_scheduled_collection_prepares_storage_only(client, monkeypatch):
     calls = []
     data = {"portal": {"messages": [], "error": None}}
@@ -95,6 +282,9 @@ def test_busy_operations_are_rejected_and_polls_skip(client, monkeypatch):
     try:
         assert client.post("/brief").status_code == 409
         assert client.post("/initialize").status_code == 409
+        assert client.post("/scrape-udt").status_code == 409
+        assert client.post("/fetch-whatsapp").status_code == 409
+        assert client.post("/email-brief").status_code == 409
         monkeypatch.setattr(service.daily_brief, "run", lambda: pytest.fail("Busy poll must skip"))
         client.app.state.scheduler.get_job("collect_messages").func()
     finally:
@@ -195,6 +385,9 @@ def test_api_token_is_required_when_configured(monkeypatch):
         assert client.get("/health").status_code == 401
         assert client.post("/brief", headers={"Authorization": "Bearer wrong"}).status_code == 401
         assert client.post("/initialize").status_code == 401
+        assert client.post("/scrape-udt").status_code == 401
+        assert client.post("/fetch-whatsapp").status_code == 401
+        assert client.post("/email-brief").status_code == 401
         assert client.get("/health", headers={"Authorization": "Bearer test-token"}).status_code == 200
 
 

@@ -2,9 +2,8 @@ import json
 import os
 from datetime import datetime, timedelta
 
-from dateutil.relativedelta import relativedelta
-
 import pytest
+from dateutil.relativedelta import relativedelta
 
 import portal_archive
 
@@ -28,6 +27,19 @@ def test_retention_days_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("ARCHIVE_RETENTION_DAYS", value)
     with pytest.raises(ValueError, match="ARCHIVE_RETENTION_DAYS must be a positive integer"):
         portal_archive._read_retention_days()
+
+
+def test_source_cursors_are_independent(tmp_path, monkeypatch):
+    monkeypatch.setattr(portal_archive, "LAST_RUN_PATH", tmp_path / "last_run.json")
+    assert portal_archive.read_whatsapp_last_run() is None
+    portal_time = datetime(2026, 10, 8, 10)
+    whatsapp_time = datetime(2026, 10, 8, 11)
+    portal_archive.save_last_run(portal_time)
+    portal_archive.save_whatsapp_last_run(whatsapp_time)
+    assert portal_archive.read_last_run() == portal_time
+    assert portal_archive.read_whatsapp_last_run() == whatsapp_time
+    portal_archive.save_last_run(portal_time.replace(hour=12))
+    assert portal_archive.read_whatsapp_last_run() == whatsapp_time
 
 
 def test_read_last_run_returns_none_when_file_missing(tmp_path, monkeypatch):
