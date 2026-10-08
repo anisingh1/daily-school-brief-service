@@ -133,6 +133,107 @@ def test_generation_places_dress_in_dress_code_only(monkeypatch, hour, minute, i
     assert content.reminders == ["October 12: School event."]
 
 
+@pytest.mark.parametrize("now, start, end", [
+    (datetime(2026, 10, 8, tzinfo=generate_brief.IST), "2026-10-01", "2026-10-31"),
+    (datetime(2026, 2, 28, tzinfo=generate_brief.IST), "2026-02-01", "2026-02-28"),
+    (datetime(2028, 2, 29, tzinfo=generate_brief.IST), "2028-02-01", "2028-02-29"),
+    (datetime(2026, 12, 31, tzinfo=generate_brief.IST), "2026-12-01", "2026-12-31"),
+    (datetime(2026, 9, 30, 20, tzinfo=timezone.utc), "2026-10-01", "2026-10-31"),
+])
+def test_calendar_covers_current_ist_month_even_at_boundaries(monkeypatch, now, start, end):
+    monkeypatch.setattr(generate_brief, "create_client", lambda: pytest.fail("Empty sources must not call Azure"))
+    context = generate_brief.date_context(now)
+    assert context["calendar_start_ist"] == start
+    assert context["calendar_end_ist"] == end
+    content = generate_brief.generate({}, now=now)
+    dates = [day.date.isoformat() for day in content.calendar]
+    assert dates[0] == start
+    assert dates[-1] == end
+    assert len(dates) == int(end[-2:])
+    assert len(dates) == len(set(dates))
+    assert all(not day.homework and not day.classwork and not day.homework_pages for day in content.calendar)
+
+
+def test_calendar_normalization_retains_month_events_and_clears_future_assignments(monkeypatch):
+    documents = [
+        {"category": "notebook_page", "name": "Homework.pdf", "url": "/pdfs/homework.pdf"},
+        {"category": "school_notice", "name": "Planner.pdf", "url": "/pdfs/planner.pdf"},
+    ]
+    now = datetime(2026, 10, 8, 12, tzinfo=generate_brief.IST)
+    monkeypatch.setattr(generate_brief, "prepare_input", lambda *_args, **_kwargs: (
+        {**generate_brief.date_context(now), "sources": {}, "documents": documents}, [], [],
+    ))
+    raw = generate_brief.empty_brief("date", []).model_dump(mode="json")
+
+    def day(date, **overrides):
+        entry = {"date": date, "classwork": [], "homework": [], "homework_pages": [],
+                 "agenda": [], "reminders": [], "holidays": []}
+        entry.update(overrides)
+        return entry
+
+    raw["calendar"] = [
+        day("2026-10-02", holidays=[{"date": "2026-10-02", "reason": "Past planner holiday"}]),
+        day("2026-10-07", classwork=["Read chapter 3"], homework=["Complete page 12"], homework_pages=[
+            {"name": "Wrong name", "url": "/pdfs/homework.pdf"},
+            {"name": "Planner", "url": "/pdfs/planner.pdf"},
+        ]),
+        day("2026-10-07", homework=["Complete page 12", "Write five words"], homework_pages=[
+            {"name": "Duplicate", "url": "/pdfs/homework.pdf"},
+        ]),
+        day("2026-10-08", classwork=["Today's classwork"], homework=["Today's homework"]),
+        day("2026-10-25", classwork=["Invented future classwork"], homework=["Invented future homework"],
+            homework_pages=[{"name": "Homework", "url": "/pdfs/homework.pdf"}],
+            agenda=["Half-day dismissal at 12:00"], reminders=["Route 4 pickup changes to 07:30"]),
+        day("2026-10-30", holidays=[
+            {"date": "2026-10-30", "reason": "Planner holiday"},
+            {"date": "2026-10-29", "reason": "Wrong date"},
+        ]),
+        day("2026-11-01", agenda=["Outside current month"]),
+    ]
+
+    def create(**kwargs):
+        schema = kwargs["response_format"]["json_schema"]["schema"]
+        assert "calendar" in schema["required"]
+        assert set(schema["$defs"]["CalendarDay"]["required"]) == {
+            "date", "classwork", "homework", "homework_pages", "agenda", "reminders", "holidays",
+        }
+        prompt = kwargs["messages"][0]["content"]
+        assert "covering the entire current IST month" in prompt
+        assert "beyond the five-day window" in prompt
+        assert "Do not carry the daily summary's latest homework" in prompt
+        return SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="stop", message=SimpleNamespace(refusal=None, content=json.dumps(raw)),
+        )])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)), close=lambda: None)
+    monkeypatch.setattr(generate_brief, "create_client", lambda: (client, "deployment"))
+    content = generate_brief.generate({"portal": {"messages": [{"body": "Monthly planner"}]}}, now=now)
+    dates = [entry.date.isoformat() for entry in content.calendar]
+    assert dates == [f"2026-10-{number:02d}" for number in range(1, 32)]
+    days = {entry.date.isoformat(): entry for entry in content.calendar}
+    assert days["2026-10-07"].homework == ["Complete page 12", "Write five words"]
+    assert days["2026-10-07"].classwork == ["Read chapter 3"]
+    assert [page.model_dump() for page in days["2026-10-07"].homework_pages] == [
+        {"name": "Homework.pdf", "url": "/pdfs/homework.pdf"},
+    ]
+    assert days["2026-10-08"].homework == ["Today's homework"]
+    assert days["2026-10-25"].homework == days["2026-10-25"].classwork == days["2026-10-25"].homework_pages == []
+    assert days["2026-10-25"].agenda == ["Half-day dismissal at 12:00"]
+    assert days["2026-10-25"].reminders == ["Route 4 pickup changes to 07:30"]
+    assert days["2026-10-02"].holidays[0].reason == "Past planner holiday"
+    assert [holiday.model_dump(mode="json") for holiday in content.holidays] == [
+        {"date": "2026-10-30", "reason": "Planner holiday"},
+    ]
+    assert days["2026-10-01"].agenda == []
+    assert "An unsupported homework PDF link was omitted." in content.warnings
+
+
+def test_older_saved_briefs_default_to_empty_calendar():
+    legacy = generate_brief.empty_brief("date", []).model_dump(mode="json")
+    del legacy["calendar"]
+    assert generate_brief.BriefContent.model_validate_json(json.dumps(legacy)).calendar == []
+
+
 def test_holidays_default_to_empty_for_older_saved_briefs():
     legacy = generate_brief.empty_brief("date", []).model_dump(mode="json")
     del legacy["holidays"]

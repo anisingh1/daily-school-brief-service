@@ -68,6 +68,11 @@ Do not overwrite an existing `.env`. Fill in these settings:
 - `EMAIL_TO`: recipients for optional email delivery, comma-separated.
 - `WHATSAPP_EMAIL_TO`: capture mailbox address. Complete the phone automation
   setup in [docs/PHONE_SETUP.md](docs/PHONE_SETUP.md) to enable this source.
+- `WHATSAPP_SUBJECT_PREFIX`: mandatory capture identifier in email subjects,
+  default `[WhatsApp School]`. Only subjects equal to this marker or starting
+  with the marker followed by a space are imported. Other mail to the capture
+  address is ignored; an empty marker is rejected. This is a routing identifier,
+  not sender authentication. Existing unmarked forwarded mail is not imported.
 
 The schedule and retention settings are shown below. Retention must be a
 positive integer. Keep `.env` private and never commit it. School messages and
@@ -157,7 +162,7 @@ curl -X POST http://127.0.0.1:8000/brief
 ```
 
 This applies cleanup, reads the retained archives and cached documents, calls
-Azure for the daily brief, returns the validated ten-field JSON, and writes
+Azure for the daily brief, returns the validated eleven-field JSON, and writes
 `output/daily_brief_content.json`. It never fetches new portal/WhatsApp messages
 or sends email. Missing PDF caches are prepared as needed. Initialization is
 required if no archive exists. Failures return HTTP 502 rather than stale content.
@@ -175,6 +180,43 @@ An explicit color legend takes precedence; unclear dates or colors produce
 warnings. Confirmed holidays suppress that day's school dress/activity packing
 instructions unless an explicit attendance instruction overrides the closure.
 PDF cache version `v3` refreshes older extractions to preserve these visual cues.
+
+For a date-selecting frontend, use the response's `calendar` array. It contains
+one ISO-dated entry for every day of the current month in IST, in date order,
+including days with no known content. Each entry has `date`, `classwork`,
+`homework`, `homework_pages`, `agenda`, `reminders`, and `holidays`.
+Agenda, reminders, and holidays include known planner/notice facts throughout
+the month, not just tomorrow or the next five days. Reminders are attached to
+the date an action is required. Notice overrides are resolved per affected date.
+Homework, classwork, and homework PDF links are tied to their actual school
+dates; Python always clears these fields on future dates. Unknown content stays
+empty rather than being predicted or copied from the daily summary.
+
+Example calendar entry (the actual array contains every date in the month):
+
+```json
+{
+  "calendar": [
+    {
+      "date": "2026-10-25",
+      "classwork": [],
+      "homework": [],
+      "homework_pages": [],
+      "agenda": ["Half-day dismissal at 12:00"],
+      "reminders": ["Route 4 pickup changes to 07:30"],
+      "holidays": []
+    }
+  ]
+}
+```
+
+The top-level fields retain their daily-summary behavior, including tomorrow's
+agenda and the five-day reminder window; the calendar is the monthly frontend
+view. It is saved with the brief JSON but is not expanded into the daily email.
+Older saved briefs without `calendar` remain readable. The frontend should cache
+older months itself: this response covers the current month using retained
+sources only. PDF links are subject to server retention, so retaining a link
+alone does not preserve the PDF file after cleanup.
 
 Newer explicit school notices from the portal or WhatsApp override older planner
 entries for the specified dates, class, and bus route. Closure and reopening
@@ -309,7 +351,7 @@ before running standalone commands against the same output files.
   preserving dates, scans, and student-to-assignment table rows. Validated
   page text is cached by SHA-256 and extraction version under `data/pdf_cache/`.
   Unchanged PDFs reuse that text without another PDF/image request. A separate
-  daily Azure call applies the school rules and validates the ten-field brief
+  daily Azure call applies the school rules and validates the eleven-field brief
   using Pydantic. Dates are computed in IST by Python.
 - **`render_email.py`** — pure function, `render_brief_html(data)`,
   turning Azure's validated categorization (`output/daily_brief_content.json`)

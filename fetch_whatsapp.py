@@ -5,7 +5,7 @@ Messages are captured by two MacroDroid rules on an Android phone (see
 docs/PHONE_SETUP.md):
   - A Notification Received rule (WhatsApp, filtered to the school
     group's chat name) sends a plain email for each text message -
-    Subject = sender, Body = message text, Date = when it arrived.
+    Subject = [WhatsApp School] sender, Body = message text, Date = when it arrived.
   - A File Added rule (watching WhatsApp's own auto-save "Documents"
     folder) sends an email with the new file attached whenever a
     document arrives in any chat.
@@ -23,6 +23,8 @@ SETUP:
       sends to, e.g. "you+whatsapp@gmail.com" (Gmail delivers "+" alias
       mail to the same inbox, so this module can filter for it via IMAP
       search without any separate account or server-side filter).
+        - Both capture rules must prefix the email subject with [WhatsApp School],
+            or the value configured in WHATSAPP_SUBJECT_PREFIX. Other emails are ignored.
 
 USAGE:
     python fetch_whatsapp.py
@@ -32,6 +34,7 @@ import email
 import imaplib
 import os
 from datetime import datetime, timedelta
+from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -46,6 +49,7 @@ IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
 SMTP_USERNAME = os.getenv("SMTP_USERNAME")
 SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD")
 WHATSAPP_EMAIL_TO = os.getenv("WHATSAPP_EMAIL_TO")
+WHATSAPP_SUBJECT_PREFIX = os.getenv("WHATSAPP_SUBJECT_PREFIX", "[WhatsApp School]").strip()
 LOOKBACK_HOURS = float(os.getenv("LOOKBACK_HOURS", "36"))
 
 ATTACHMENTS_DIR = Path(__file__).parent / "data" / "pdfs"
@@ -58,13 +62,27 @@ def _is_pdf_part(part: Message) -> bool:
     return part.get_content_disposition() == "attachment" and filename.lower().endswith(".pdf")
 
 
+def _decoded_payload(part: Message) -> bytes | None:
+    payload = part.get_payload(decode=True)
+    if payload is not None and not isinstance(payload, bytes):
+        raise ValueError("Email part has a non-byte decoded payload")
+    return payload
+
+
 def _save_pdf_attachment(part: Message, uid: str, save_dir: Path) -> dict:
     filename = part.get_filename() or f"{uid}.pdf"
     save_dir.mkdir(parents=True, exist_ok=True)
     dest = save_dir / f"whatsapp_{uid}_{filename}"
     if not dest.exists():
-        dest.write_bytes(part.get_payload(decode=True))
+        payload = _decoded_payload(part)
+        if payload is None:
+            raise ValueError("PDF attachment has no decoded payload")
+        dest.write_bytes(payload)
     return {"name": filename, "saved_as": str(dest)}
+
+
+def _email_subject(msg: Message) -> str:
+    return str(make_header(decode_header(msg.get("Subject", "") or "")))
 
 
 def parse_email_message(msg: Message, uid: str, save_dir: Path = ATTACHMENTS_DIR) -> dict:
@@ -78,7 +96,7 @@ def parse_email_message(msg: Message, uid: str, save_dir: Path = ATTACHMENTS_DIR
     images) are intentionally ignored - only their absence is asserted,
     not walked further.
     """
-    sender = msg.get("Subject", "") or ""
+    sender = _email_subject(msg).removeprefix(WHATSAPP_SUBJECT_PREFIX).strip()
     timestamp = parsedate_to_datetime(msg.get("Date", "")).isoformat()
     text_parts = []
     attachments = []
@@ -93,12 +111,12 @@ def parse_email_message(msg: Message, uid: str, save_dir: Path = ATTACHMENTS_DIR
                 part.get_content_type() == "text/plain"
                 and part.get_content_disposition() != "attachment"
             ):
-                payload = part.get_payload(decode=True)
+                payload = _decoded_payload(part)
                 if payload:
                     charset = part.get_content_charset() or "utf-8"
                     text_parts.append(payload.decode(charset, errors="replace"))
     else:
-        payload = msg.get_payload(decode=True)
+        payload = _decoded_payload(msg)
         if payload:
             charset = msg.get_content_charset() or "utf-8"
             text_parts.append(payload.decode(charset, errors="replace"))
@@ -151,6 +169,8 @@ def _connect_imap() -> imaplib.IMAP4_SSL:
 def fetch_recent_whatsapp_messages(
     lookback_hours: float | None = None, cutoff: datetime | None = None
 ) -> list[dict]:
+    if not WHATSAPP_SUBJECT_PREFIX:
+        raise RuntimeError("WHATSAPP_SUBJECT_PREFIX must not be empty")
     if cutoff is None:
         if lookback_hours is None:
             lookback_hours = LOOKBACK_HOURS
@@ -163,9 +183,17 @@ def fetch_recent_whatsapp_messages(
         uids = data[0].split() if data and data[0] else []
         messages = []
         for uid in uids:
-            _, msg_data = conn.fetch(uid, "(RFC822)")
-            raw = msg_data[0][1]
+            fetch_status, msg_data = conn.fetch(uid, "(RFC822)")
+            if fetch_status != "OK":
+                raise RuntimeError("IMAP message fetch failed")
+            raw = next((item[1] for item in msg_data
+                        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], bytes)), None)
+            if raw is None:
+                raise RuntimeError("IMAP response did not contain email bytes")
             msg = email.message_from_bytes(raw)
+            subject = _email_subject(msg)
+            if subject != WHATSAPP_SUBJECT_PREFIX and not subject.startswith(WHATSAPP_SUBJECT_PREFIX + " "):
+                continue
             timestamp = parsedate_to_datetime(msg.get("Date", "")).isoformat()
             if not filter_recent([{"timestamp": timestamp}], cutoff=cutoff):
                 continue

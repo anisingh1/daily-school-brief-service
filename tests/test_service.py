@@ -294,6 +294,7 @@ def test_brief_uses_stored_archives_without_fetching_or_sending(client, monkeypa
         content.holidays = [service.generate_brief.Holiday.model_validate_json(
             '{"date": "2026-10-09", "reason": "School closure notice"}',
         )]
+        content.calendar = service.generate_brief.normalize_calendar(content, now.date(), {})
         return content
 
     monkeypatch.setattr(service.generate_brief, "generate", generate)
@@ -302,12 +303,15 @@ def test_brief_uses_stored_archives_without_fetching_or_sending(client, monkeypa
     assert response.status_code == 200
     assert response.json()["homework"] == ["Read page 12"]
     assert response.json()["holidays"] == [{"date": "2026-10-09", "reason": "School closure notice"}]
+    assert len(response.json()["calendar"]) >= 28
+    assert response.json()["calendar"][0]["date"].endswith("-01")
     assert calls[0]["portal"]["messages"] == [message]
     assert service.generate_brief.CONTENT_PATH.exists()
     saved = service.generate_brief.BriefContent.model_validate_json(
         service.generate_brief.CONTENT_PATH.read_text(encoding="utf-8"),
     )
     assert saved.model_dump(mode="json")["holidays"] == response.json()["holidays"]
+    assert saved.model_dump(mode="json")["calendar"] == response.json()["calendar"]
 
 
 def test_briefs_generate_in_parallel_while_poll_updates_storage(client, monkeypatch):

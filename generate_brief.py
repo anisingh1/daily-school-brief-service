@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+from calendar import monthrange
 from datetime import date as calendar_date
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -102,6 +103,27 @@ Apply these rules:
 - Other reminders must apply between tomorrow and today plus five days,
     inclusive. Exclude dress-related instructions, which belong in dress_code.
     Omit further-out events and expired notices.
+- In calendar, provide one entry per date from calendar_start_ist through
+    calendar_end_ist inclusive, covering the entire current IST month. These
+    calendar entries are independent of the daily-summary agenda/reminder
+    windows: include agenda, reminders, and confirmed holidays on their applicable
+    dates throughout the month, including past dates and future planner events
+    beyond the five-day window. Preserve exact event, dismissal, and bus times
+    and reconcile newer notices with older planners for each affected date.
+    Put reminders on the date an action is required; do not repeat a reminder
+    on every day or move an event to its announcement date. Expand explicit
+    multi-day events and holiday ranges into the affected calendar dates.
+    Each entry has date, classwork, homework, homework_pages, agenda, reminders,
+    and holidays. Holiday entries must match that day's date; exclude cancelled
+    closures and do not treat half days or bus-only changes as holidays.
+    Calendar classwork, homework, and notebook PDF links describe only what was
+    actually posted for that school date, which must be today_ist or earlier.
+    Use explicit school dates in a Flow of the Day or homework post, otherwise
+    its source timestamp in IST. Do not carry the daily summary's latest homework
+    into unrelated calendar dates. For dates after today_ist, classwork, homework,
+    and homework_pages must always be []; never predict future assignments.
+    Unknown sections are [] rather than guessed. The restrictions above on the
+    top-level daily-summary fields do not limit the calendar's monthly scope.
 - Do not infer dates from the machine's timezone or assume that every notice
     applies tomorrow. Use the explicit IST dates in the input.
 - Include meaningful uncertainty as a warning, never guess unreadable content.
@@ -123,6 +145,17 @@ class Holiday(BaseModel):
     reason: str
 
 
+class CalendarDay(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    date: calendar_date
+    classwork: list[str]
+    homework: list[str]
+    homework_pages: list[HomeworkPage]
+    agenda: list[str]
+    reminders: list[str]
+    holidays: list[Holiday]
+
+
 class BriefContent(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     date: str
@@ -135,6 +168,7 @@ class BriefContent(BaseModel):
     holidays: list[Holiday] = Field(default_factory=list)
     dress_code: str | None
     reminders: list[str]
+    calendar: list[CalendarDay] = Field(default_factory=list)
 
 
 def empty_brief(brief_date: str, warnings: list[str]) -> BriefContent:
@@ -144,6 +178,52 @@ def empty_brief(brief_date: str, warnings: list[str]) -> BriefContent:
     )
 
 
+def select_homework_pages(pages: list[HomeworkPage], notebook_pages: dict[str, HomeworkPage],
+                          warnings: list[str]) -> list[HomeworkPage]:
+    selected: dict[str, HomeworkPage] = {}
+    for page in pages:
+        if page.url in notebook_pages:
+            selected[page.url] = notebook_pages[page.url]
+        elif "An unsupported homework PDF link was omitted." not in warnings:
+            warnings.append("An unsupported homework PDF link was omitted.")
+    return list(selected.values())
+
+
+def normalize_calendar(content: BriefContent, today: calendar_date,
+                       notebook_pages: dict[str, HomeworkPage]) -> list[CalendarDay]:
+    days = {
+        today.replace(day=number): CalendarDay(
+            date=today.replace(day=number), classwork=[], homework=[], homework_pages=[],
+            agenda=[], reminders=[], holidays=[],
+        )
+        for number in range(1, monthrange(today.year, today.month)[1] + 1)
+    }
+    for entry in content.calendar:
+        day = days.get(entry.date)
+        if day is None:
+            continue
+        for field in ("classwork", "homework", "agenda", "reminders"):
+            setattr(day, field, list(dict.fromkeys(getattr(day, field) + getattr(entry, field))))
+        day.homework_pages.extend(entry.homework_pages)
+        day.holidays.extend(holiday for holiday in entry.holidays if holiday.date == day.date)
+    upcoming_holidays = {holiday.date: holiday for holiday in content.holidays if holiday.date >= today}
+    for day in days.values():
+        if day.date > today:
+            day.classwork = []
+            day.homework = []
+            day.homework_pages = []
+        else:
+            day.homework_pages = select_homework_pages(day.homework_pages, notebook_pages, content.warnings)
+        if day.date in upcoming_holidays:
+            day.holidays = [upcoming_holidays[day.date]]
+        else:
+            day.holidays = list({holiday.date: holiday for holiday in day.holidays}.values())
+            if day.date >= today and day.holidays:
+                upcoming_holidays[day.date] = day.holidays[0]
+    content.holidays = [upcoming_holidays[date] for date in sorted(upcoming_holidays)]
+    return list(days.values())
+
+
 class _DateContext(TypedDict):
     today_ist: str
     today_weekday: str
@@ -151,6 +231,8 @@ class _DateContext(TypedDict):
     tomorrow_ist: str
     tomorrow_weekday: str
     reminders_through_ist: str
+    calendar_start_ist: str
+    calendar_end_ist: str
     brief_date: str
 
 
@@ -167,6 +249,8 @@ def date_context(now: datetime | None = None) -> _DateContext:
         "tomorrow_ist": tomorrow.isoformat(),
         "tomorrow_weekday": tomorrow.strftime("%A"),
         "reminders_through_ist": (today + timedelta(days=5)).isoformat(),
+        "calendar_start_ist": today.replace(day=1).isoformat(),
+        "calendar_end_ist": today.replace(day=monthrange(today.year, today.month)[1]).isoformat(),
         "brief_date": f"{tomorrow.strftime('%A, %B')} {tomorrow.day}, {tomorrow.year}",
     }
 
@@ -394,7 +478,9 @@ def generate(data: dict[str, Any], now: datetime | None = None, *,
              cache_writes: dict[Path, dict[str, Any]] | None = None) -> BriefContent:
     if not any(source.get("messages") for source in data.values()):
         payload, warnings, _ = prepare_input(data, now)
-        return empty_brief(payload["brief_date"], warnings)
+        content = empty_brief(payload["brief_date"], warnings)
+        content.calendar = normalize_calendar(content, calendar_date.fromisoformat(payload["today_ist"]), {})
+        return content
     client, deployment = create_client()
     try:
         started = monotonic()
@@ -441,13 +527,8 @@ def generate(data: dict[str, Any], now: datetime | None = None, *,
             document["url"]: HomeworkPage(name=document["name"], url=document["url"])
             for document in payload["documents"] if document["category"] == "notebook_page"
         }
-        selected_pages: dict[str, HomeworkPage] = {}
-        for page in content.homework_pages:
-            if page.url in notebook_pages:
-                selected_pages[page.url] = notebook_pages[page.url]
-            elif "An unsupported homework PDF link was omitted." not in content.warnings:
-                content.warnings.append("An unsupported homework PDF link was omitted.")
-        content.homework_pages = list(selected_pages.values())
+        content.homework_pages = select_homework_pages(content.homework_pages, notebook_pages, content.warnings)
+        content.calendar = normalize_calendar(content, today, notebook_pages)
         return content
     finally:
         client.close()
