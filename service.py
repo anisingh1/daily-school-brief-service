@@ -94,7 +94,7 @@ def create_app() -> FastAPI:
             }
             LOGGER.info("Collection and brief generation completed in %.2fs", monotonic() - started)
             return application.state.last_poll
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             application.state.last_poll = {
                 "at": format_poll_time(datetime.now(timezone)), "error": type(error).__name__,
                 "brief_generated": False,
