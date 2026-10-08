@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from threading import Barrier, Event
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -226,7 +226,7 @@ def test_source_endpoint_failure_preserves_cursor(client, monkeypatch, route, so
 def test_email_requires_saved_brief(client):
     response = client.post("/email-brief")
     assert response.status_code == 409
-    assert "POST /brief" in response.json()["detail"]
+    assert "POST /refresh" in response.json()["detail"]
     assert not client.app.state.operation_lock.locked()
 
 
@@ -274,84 +274,78 @@ def test_email_failure_preserves_preview_and_releases_lock(client, monkeypatch):
     assert not client.app.state.operation_lock.locked()
 
 
-def test_brief_requires_storage(client):
+def test_brief_requires_saved_content(client):
     response = client.post("/brief")
     assert response.status_code == 409
-    assert "Initialize storage" in response.json()["detail"]
+    assert "POST /refresh" in response.json()["detail"]
+    assert client.get("/brief").status_code == 409
 
 
-def test_brief_uses_stored_archives_without_fetching_or_sending(client, monkeypatch):
-    message = {"id": "1", "posted_at": datetime.now(service.portal_archive.IST).isoformat(),
-               "body": "Read page 12", "attachments": []}
-    service.portal_archive.save_archive([message])
+def test_brief_reads_saved_content_without_fetching_generating_or_sending(client, monkeypatch):
+    content = service.generate_brief.empty_brief("date", [])
+    content.homework = ["Read page 12"]
+    content.holidays = [service.generate_brief.Holiday.model_validate_json(
+        '{"date": "2026-10-09", "reason": "School closure notice"}',
+    )]
+    content.calendar = service.generate_brief.normalize_calendar(
+        content, datetime(2026, 10, 8).date(), {},
+    )
+    service.generate_brief.write_content(content)
+    monkeypatch.setattr(service.daily_brief, "run", lambda: pytest.fail("Unexpected collection"))
+    monkeypatch.setattr(service.generate_brief, "generate", lambda *args, **kwargs: pytest.fail("Unexpected generation"))
+    monkeypatch.setattr(service.generate_brief, "load_stored_input", lambda *args: pytest.fail("Unexpected archive loading"))
+    monkeypatch.setattr(service.daily_brief.send_email, "run", lambda **kwargs: pytest.fail("Unexpected email"))
+    with client.app.state.operation_lock:
+        for request in (client.get, client.post):
+            response = request("/brief")
+            assert response.status_code == 200
+            assert response.json() == content.model_dump(mode="json")
+
+
+def test_saved_brief_reads_remain_available_during_refresh(client, monkeypatch):
+    timestamp = datetime.now(service.portal_archive.IST).isoformat()
+    updated = {"id": "new", "posted_at": timestamp, "body": "New homework", "attachments": []}
+    original = service.generate_brief.empty_brief("date", [])
+    original.homework = ["Old homework"]
+    service.generate_brief.write_content(original)
+    generation_started = Event()
+    finish_generation = Event()
     calls = []
 
     def generate(data, now, **kwargs):
-        assert not client.app.state.operation_lock.locked()
-        calls.append(data)
-        content = service.generate_brief.empty_brief("date", [])
-        content.homework = ["Read page 12"]
-        content.holidays = [service.generate_brief.Holiday.model_validate_json(
-            '{"date": "2026-10-09", "reason": "School closure notice"}',
-        )]
-        content.calendar = service.generate_brief.normalize_calendar(content, now.date(), {})
-        return content
-
-    monkeypatch.setattr(service.generate_brief, "generate", generate)
-    monkeypatch.setattr(service.daily_brief.send_email, "run", lambda **kwargs: pytest.fail("Unexpected email"))
-    response = client.post("/brief")
-    assert response.status_code == 200
-    assert response.json()["homework"] == ["Read page 12"]
-    assert response.json()["holidays"] == [{"date": "2026-10-09", "reason": "School closure notice"}]
-    assert len(response.json()["calendar"]) >= 28
-    assert response.json()["calendar"][0]["date"].endswith("-01")
-    assert calls[0]["portal"]["messages"] == [message]
-    assert service.generate_brief.CONTENT_PATH.exists()
-    saved = service.generate_brief.BriefContent.model_validate_json(
-        service.generate_brief.CONTENT_PATH.read_text(encoding="utf-8"),
-    )
-    assert saved.model_dump(mode="json")["holidays"] == response.json()["holidays"]
-    assert saved.model_dump(mode="json")["calendar"] == response.json()["calendar"]
-
-
-def test_briefs_generate_in_parallel_while_poll_updates_storage(client, monkeypatch):
-    timestamp = datetime.now(service.portal_archive.IST).isoformat()
-    original = {"id": "old", "posted_at": timestamp, "body": "Old homework", "attachments": []}
-    updated = {"id": "new", "posted_at": timestamp, "body": "New homework", "attachments": []}
-    service.portal_archive.save_archive([original])
-    first_started = Event()
-    parallel_generation = Barrier(2)
-
-    def generate(data, now, **kwargs):
-        assert not client.app.state.operation_lock.locked()
-        first_started.set()
-        parallel_generation.wait(timeout=5)
+        assert client.app.state.operation_lock.locked()
+        calls.append("generate")
+        generation_started.set()
+        assert finish_generation.wait(timeout=5)
         content = service.generate_brief.empty_brief("date", [])
         content.homework = [data["portal"]["messages"][0]["body"]]
         return content
 
     def collect():
+        calls.append("collect")
         service.portal_archive.save_archive([updated])
         return {"portal": {"messages": [updated], "error": None}}
 
     monkeypatch.setattr(service.generate_brief, "generate", generate)
     monkeypatch.setattr(service.daily_brief, "run", collect)
-    monkeypatch.setattr(service, "prepare_storage", lambda data: {"messages": {"portal": 1}})
+    monkeypatch.setattr(service, "prepare_storage", lambda data: calls.append("cache") or {"messages": {"portal": 1}})
     with ThreadPoolExecutor(max_workers=1) as executor:
-        first = executor.submit(client.post, "/brief")
-        assert first_started.wait(timeout=5)
-        assert client.get("/health").json()["busy"] is False
-        client.app.state.scheduler.get_job("collect_messages").func()
-        assert client.get("/health").json()["last_poll"]["messages"] == {"portal": 1}
-        second = client.post("/brief")
-        first_response = first.result(timeout=5)
-    assert first_response.status_code == second.status_code == 200
-    assert first_response.json()["homework"] == ["Old homework"]
-    assert second.json()["homework"] == ["New homework"]
-    saved = service.generate_brief.BriefContent.model_validate_json(
-        service.generate_brief.CONTENT_PATH.read_text(encoding="utf-8"),
-    )
-    assert saved.homework in (["Old homework"], ["New homework"])
+        refresh = executor.submit(client.post, "/refresh")
+        try:
+            assert generation_started.wait(timeout=5)
+            assert client.get("/health").json()["busy"] is True
+            for request in (client.get, client.post):
+                response = request("/brief")
+                assert response.status_code == 200
+                assert response.json()["homework"] == ["Old homework"]
+            assert client.post("/refresh").status_code == 409
+            client.app.state.scheduler.get_job("collect_messages").func()
+            assert calls == ["collect", "cache", "generate"]
+        finally:
+            finish_generation.set()
+        assert refresh.result(timeout=5).status_code == 200
+    assert client.get("/brief").json()["homework"] == ["New homework"]
+    assert client.get("/health").json()["last_poll"]["brief_generated"] is True
     assert not client.app.state.operation_lock.locked()
 
 
@@ -376,16 +370,6 @@ def test_poll_updates_both_archives_and_brief_reads_latest_storage(client, monke
     monkeypatch.setattr(service, "prepare_storage", lambda data: prepared.append(data) or {
         "messages": {name: len(source["messages"]) for name, source in data.items()},
     })
-    client.app.state.scheduler.get_job("collect_messages").func()
-    assert prepared[0]["portal"]["messages"] == [portal]
-    assert prepared[0]["whatsapp"]["messages"] == [whatsapp]
-    assert service.portal_archive.read_last_run() is not None
-    assert service.portal_archive.read_whatsapp_last_run() is not None
-    assert client.get("/health").json()["last_poll"]["messages"] == {"portal": 1, "whatsapp": 1}
-    service.portal_archive.write_json(service.daily_brief.OUTPUT_PATH, {
-        "portal": {"messages": [], "error": None}, "whatsapp": {"messages": [], "error": None},
-    })
-
     def generate(data, now, **kwargs):
         assert data["portal"]["messages"] == [portal]
         assert data["whatsapp"]["messages"] == [whatsapp]
@@ -395,20 +379,43 @@ def test_poll_updates_both_archives_and_brief_reads_latest_storage(client, monke
         return content
 
     monkeypatch.setattr(service.generate_brief, "generate", generate)
+    client.app.state.scheduler.get_job("collect_messages").func()
+    assert prepared[0]["portal"]["messages"] == [portal]
+    assert prepared[0]["whatsapp"]["messages"] == [whatsapp]
+    assert service.portal_archive.read_last_run() is not None
+    assert service.portal_archive.read_whatsapp_last_run() is not None
+    assert client.get("/health").json()["last_poll"]["messages"] == {"portal": 1, "whatsapp": 1}
+    service.portal_archive.write_json(service.daily_brief.OUTPUT_PATH, {
+        "portal": {"messages": [], "error": None}, "whatsapp": {"messages": [], "error": None},
+    })
     response = client.post("/brief")
     assert response.status_code == 200
     assert response.json()["homework"] == ["New homework"]
     assert response.json()["reminders"] == ["New notice"]
 
 
-def test_scheduled_collection_prepares_storage_only(client, monkeypatch):
+@pytest.mark.parametrize("manual", [False, True])
+def test_cron_and_refresh_collect_cache_generate_and_save(client, monkeypatch, manual):
     calls = []
     data = {"portal": {"messages": [], "error": None}}
     monkeypatch.setattr(service.daily_brief, "run", lambda: calls.append("collect") or data)
     monkeypatch.setattr(service, "prepare_storage", lambda data: calls.append("cache") or {"messages": {"portal": 0}})
-    monkeypatch.setattr(service.generate_brief, "generate", lambda **kwargs: pytest.fail("Unexpected brief generation"))
-    client.app.state.scheduler.get_job("collect_messages").func()
-    assert calls == ["collect", "cache"]
+    def generate(collected, now):
+        assert collected == data
+        calls.append("generate")
+        content = service.generate_brief.empty_brief("date", [])
+        content.homework = ["Generated homework"]
+        return content
+
+    monkeypatch.setattr(service.generate_brief, "generate", generate)
+    if manual:
+        response = client.post("/refresh")
+        assert response.status_code == 200
+        assert response.json()["brief_generated"] is True
+    else:
+        client.app.state.scheduler.get_job("collect_messages").func()
+    assert calls == ["collect", "cache", "generate"]
+    assert client.get("/brief").json()["homework"] == ["Generated homework"]
     assert client.get("/health").json()["last_poll"]["messages"] == {"portal": 0}
 
 
@@ -416,7 +423,7 @@ def test_busy_operations_are_rejected_and_polls_skip(client, monkeypatch):
     lock = client.app.state.operation_lock
     lock.acquire()
     try:
-        assert client.post("/brief").status_code == 409
+        assert client.post("/refresh").status_code == 409
         assert client.post("/initialize").status_code == 409
         assert client.post("/scrape-udt").status_code == 409
         assert client.post("/fetch-whatsapp").status_code == 409
@@ -485,7 +492,7 @@ def test_failed_portal_initialization_does_not_claim_success(client, monkeypatch
     assert "secret" not in response.text
 
 
-def test_failed_brief_does_not_return_stale_content(client, monkeypatch):
+def test_invalid_saved_brief_is_not_returned(client, monkeypatch):
     service.portal_archive.save_archive([])
     service.portal_archive.write_json(service.generate_brief.CONTENT_PATH, {"homework": ["stale"]})
 
@@ -497,6 +504,29 @@ def test_failed_brief_does_not_return_stale_content(client, monkeypatch):
     assert response.status_code == 502
     assert "stale" not in response.text
     assert "sensitive" not in response.text
+    assert not client.app.state.operation_lock.locked()
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_failed_refresh_preserves_previous_brief_and_reports_failure(client, monkeypatch, manual):
+    content = service.generate_brief.empty_brief("date", [])
+    content.homework = ["Previous homework"]
+    service.generate_brief.write_content(content)
+    monkeypatch.setattr(service.daily_brief, "run", lambda: {"portal": {"messages": []}})
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("sensitive failure")
+
+    monkeypatch.setattr(service.generate_brief, "generate", fail)
+    if manual:
+        response = client.post("/refresh")
+        assert response.status_code == 502
+        assert "sensitive" not in response.text
+    else:
+        client.app.state.scheduler.get_job("collect_messages").func()
+    assert client.get("/brief").json() == content.model_dump(mode="json")
+    assert client.get("/health").json()["last_poll"]["error"] == "RuntimeError"
+    assert client.get("/health").json()["last_poll"]["brief_generated"] is False
     assert not client.app.state.operation_lock.locked()
 
 
@@ -519,6 +549,8 @@ def test_api_token_is_required_when_configured(monkeypatch):
     monkeypatch.setenv("MESSAGE_POLL_CRON", "0 0 1 1 *")
     with TestClient(service.create_app()) as client:
         assert client.get("/health").status_code == 401
+        assert client.get("/brief").status_code == 401
+        assert client.post("/refresh").status_code == 401
         assert client.post("/brief", headers={"Authorization": "Bearer wrong"}).status_code == 401
         assert client.post("/initialize").status_code == 401
         assert client.post("/scrape-udt").status_code == 401

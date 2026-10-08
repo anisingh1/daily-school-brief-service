@@ -5,7 +5,6 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from pathlib import Path
 from secrets import compare_digest
 from threading import Lock
 from time import monotonic
@@ -80,24 +79,37 @@ def create_app() -> FastAPI:
     operation_lock = Lock()
     scheduler = BackgroundScheduler(timezone=timezone)
 
-    def poll_messages() -> None:
+    def collect_and_generate() -> dict[str, Any]:
         if not operation_lock.acquire(blocking=False):
-            LOGGER.info("Skipping collection while another storage operation is running")
-            return
+            raise HTTPException(status_code=409, detail="Another storage operation is running; retry later")
+        started = monotonic()
         try:
             data = daily_brief.run()
             summary = prepare_storage(data)
+            LOGGER.info("Collection completed; generating saved brief")
+            generate_brief.run(data=data, now=datetime.now(portal_archive.IST))
             application.state.last_poll = {
                 "at": format_poll_time(datetime.now(timezone)), **summary,
+                "brief_generated": True, "duration_seconds": round(monotonic() - started, 2),
             }
-            LOGGER.info("Scheduled collection completed: %s", summary["messages"])
+            LOGGER.info("Collection and brief generation completed in %.2fs", monotonic() - started)
+            return application.state.last_poll
         except Exception as error:  # noqa: BLE001
             application.state.last_poll = {
                 "at": format_poll_time(datetime.now(timezone)), "error": type(error).__name__,
+                "brief_generated": False,
             }
-            LOGGER.error("Scheduled collection failed (%s)", type(error).__name__)
+            LOGGER.exception("Collection and brief generation failed (%s)", type(error).__name__)
+            raise HTTPException(status_code=502, detail=f"Refresh failed ({type(error).__name__})") from error
         finally:
             operation_lock.release()
+
+    def poll_messages() -> None:
+        try:
+            collect_and_generate()
+        except HTTPException as error:
+            if error.status_code == 409:
+                LOGGER.info("Skipping collection while another storage operation is running")
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -186,47 +198,32 @@ def create_app() -> FastAPI:
     def fetch_whatsapp() -> dict[str, Any]:
         return collect_source("whatsapp")
 
+    @application.post("/refresh", dependencies=[Depends(authorize)])
+    def refresh_brief() -> dict[str, Any]:
+        return collect_and_generate()
+
+    @application.get("/brief", response_model=generate_brief.BriefContent,
+                     dependencies=[Depends(authorize)])
     @application.post("/brief", response_model=generate_brief.BriefContent,
                       dependencies=[Depends(authorize)])
-    def prepare_brief() -> generate_brief.BriefContent:
-        started = monotonic()
-        LOGGER.info("POST /brief received")
+    def read_brief() -> generate_brief.BriefContent:
         try:
-            if not operation_lock.acquire(blocking=False):
-                LOGGER.info("POST /brief rejected: another storage operation is running")
-                raise HTTPException(status_code=409, detail="Another storage operation is running; retry later")
-            try:
-                if not portal_archive.ARCHIVE_PATH.exists() and not portal_archive.WHATSAPP_ARCHIVE_PATH.exists():
-                    raise HTTPException(status_code=409, detail="Initialize storage first with POST /initialize")
-                now = datetime.now(portal_archive.IST)
-                LOGGER.info("POST /brief snapshotting stored messages and PDFs")
-                data = generate_brief.load_stored_input(now)
-                pdf_snapshot = generate_brief.snapshot_pdfs(data)
-            finally:
-                operation_lock.release()
-            LOGGER.info("POST /brief generating outside storage lock")
-            cache_writes: dict[Path, dict[str, Any]] = {}
-            content = generate_brief.generate(data, now=now, pdf_snapshot=pdf_snapshot,
-                                             cache_writes=cache_writes)
-            LOGGER.info("POST /brief publishing content and PDF caches")
-            with operation_lock:
-                for path, cached_document in cache_writes.items():
-                    portal_archive.write_json(path, cached_document)
-                generate_brief.write_content(content)
-            LOGGER.info("POST /brief completed in %.2fs", monotonic() - started)
-            return content
-        except HTTPException:
-            raise
+            return generate_brief.BriefContent.model_validate_json(
+                generate_brief.CONTENT_PATH.read_text(encoding="utf-8"),
+            )
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=409, detail="No saved brief; run POST /refresh or wait for cron") from error
         except Exception as error:
-            LOGGER.exception("POST /brief failed after %.2fs (%s)", monotonic() - started, type(error).__name__)
-            raise HTTPException(status_code=502, detail=f"Brief generation failed ({type(error).__name__})") from error
+            LOGGER.error("Reading saved brief failed (%s)", type(error).__name__)
+            raise HTTPException(status_code=502, detail=f"Saved brief unavailable ({type(error).__name__})") from error
+
     @application.post("/email-brief", dependencies=[Depends(authorize)])
     def email_brief() -> dict[str, str]:
         if not operation_lock.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="Another storage operation is running; retry later")
         try:
             if not send_email.CONTENT_PATH.exists():
-                raise HTTPException(status_code=409, detail="Generate a brief first with POST /brief")
+                raise HTTPException(status_code=409, detail="Generate a brief first with POST /refresh")
             generate_brief.BriefContent.model_validate_json(send_email.CONTENT_PATH.read_text(encoding="utf-8"))
             send_email.run()
             return {"status": "sent"}

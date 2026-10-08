@@ -22,9 +22,10 @@ versions; the current workflow and run instructions are below.
   file hash and extraction version, so unchanged PDFs are not uploaded again.
 4. Collection and brief generation apply retention cleanup, defaulting to 35
   days. Retained message timestamps determine which messages and PDFs stay.
-5. Call `POST /brief` to generate today's brief from stored messages and cached
-  PDF text. Azure applies the school rules; Python validates the JSON output
-  and saves it locally. This endpoint does not collect messages or send email.
+5. After collection and PDF preparation, the same cron job generates the brief.
+  Azure applies the school rules; Python validates and saves the JSON output.
+  Call `GET /brief` (or `POST /brief`) to read it without any Azure calls.
+  Use `POST /refresh` to run the complete cron workflow immediately.
 6. Call `POST /email-brief` to email the saved brief to the configured recipients.
   For a local HTML preview without delivery, run `send_email.py --preview`
   only while the service is stopped.
@@ -33,7 +34,8 @@ Storage is local files, not a database. No Claude runtime, agent framework,
 OS cron job, or automatic Git commit is needed. Keep `data/` persistent and run
 one service process against it.
 
-The REST workflow separates collection, generation, and delivery. Running
+The REST workflow combines scheduled collection and generation, with separate
+saved-content reads and email delivery. Running
 `daily_brief.py` directly still performs all three steps in one command using
 the same shared implementations. It is an alternative to the service, not a
 second process to run alongside it against the same files.
@@ -130,14 +132,14 @@ deployment and may take time on the initial scan.
 
 At each cron tick, the service fetches new portal and WhatsApp messages using
 their separate cursors, stores text/PDFs, prepares PDF caches,
-and applies cleanup. It does not automatically generate or email a brief.
-Collection errors are visible in `GET /health` and retained data stays usable.
+applies cleanup, and generates the saved brief. It does not send email.
+Refresh errors are visible in `GET /health`; failed generation does not replace
+the last successfully saved brief.
 Starting the service does not immediately fetch or initialize storage.
-`POST /brief` always reads the latest retained archives, not a previously
-generated brief or an old input snapshot. Freshness is bounded by the last
-successful cron collection. Use the source collection endpoints before `/brief`
-when you need an immediate refresh between scheduled polls. If collection fails,
-the brief uses retained messages with a warning rather than claiming fresh data.
+`GET /brief` and `POST /brief` return the previously generated brief. Freshness
+is bounded by the last successful refresh. Use `POST /refresh` when you need an
+immediate refresh between scheduled polls. A best-effort source fetch failure
+uses retained messages with a warning rather than claiming fresh data.
 
 Collect just one source on demand:
 
@@ -155,24 +157,33 @@ Cursors advance only after successful fetching and archive persistence, so faile
 fetches or archive writes can be retried. `POST /initialize` bypasses both cursors
 to backfill storage. All collection routes share the scheduler's storage lock.
 
-Generate and return a brief from stored data on demand:
+Run the exact cron workflow manually, including collection and generation:
 
 ```bash
+curl -X POST http://127.0.0.1:8000/refresh
+```
+
+This synchronous endpoint fetches both sources, stores messages/PDFs, prepares
+caches, and calls Azure to generate `output/daily_brief_content.json`. It returns
+collection counts, warnings, `brief_generated`, and `duration_seconds`. It never
+sends email. Without initialized storage, collection uses the configured
+lookback window. Failures return HTTP 502; overlapping storage operations return
+HTTP 409. This endpoint can take as long as the scheduled workflow.
+
+Read the saved brief without collection, cleanup, or LLM calls:
+
+```bash
+curl http://127.0.0.1:8000/brief
+# Existing clients can still use:
 curl -X POST http://127.0.0.1:8000/brief
 ```
 
-This applies cleanup, reads the retained archives and cached documents, calls
-Azure for the daily brief, returns the validated eleven-field JSON, and writes
-`output/daily_brief_content.json`. It never fetches new portal/WhatsApp messages
-or sends email. Missing PDF caches are prepared as needed. Initialization is
-required if no archive exists. Failures return HTTP 502 rather than stale content.
-
-The storage lock covers only the input snapshot and publication of results.
-Messages, PDF bytes, and cached document text are snapshotted together; PDF
-processing and Azure calls run outside the lock. Brief requests can generate in
-parallel while collection updates storage. Each response uses its own snapshot;
-the last request to publish becomes the saved brief. Brief content and PDF caches
-are published atomically so readers do not see partially written JSON.
+Both methods return the validated eleven-field JSON. Missing content returns
+HTTP 409 with a prompt to run `POST /refresh`; invalid content returns HTTP 502.
+The storage lock covers the complete refresh workflow, preventing overlapping
+collection or generation. Brief reads do not acquire this lock and can return
+the previous saved result during refresh. Brief content and PDF caches are
+written atomically so readers do not see partially written JSON.
 
 Calendar planners are read visually: red-background date cells are transcribed
 as explicitly dated school holidays, even without a printed holiday label.
@@ -273,16 +284,16 @@ curl -X POST http://127.0.0.1:8000/email-brief
 This validates and renders the saved content, writes the HTML preview, and sends
 it through the existing SMTP configuration. It does not fetch messages or call
 Azure. Success returns `{"status": "sent"}`; missing content returns HTTP 409
-with a prompt to call `POST /brief`, and validation or delivery failures return
+with a prompt to call `POST /refresh`, and validation or delivery failures return
 HTTP 502. Each successful call sends an email; there are no automatic retries.
 If SMTP fails after accepting the message, delivery may be uncertain, so check
 the mailbox before retrying. Saved content and any rendered preview remain available.
 
 `GET /health` reports the schedule, next poll, retention, initialization state,
-and last scheduled collection result. Its `busy` flag reports the storage lock,
-not active Azure generation. A conflicting storage operation returns HTTP 409;
-a cron poll skips while the lock is held, but not during brief generation.
-Brief publication waits for the lock before saving results. Use one
+and the last scheduled or manual refresh result, including generation status.
+Its `busy` flag reports the storage lock, including active Azure generation.
+A conflicting storage operation returns HTTP 409; a cron poll skips while the
+lock is held. Saved brief reads remain available. Use one
 service process/worker and do not run the standalone collection/cleanup commands
 against the same files concurrently. Shutdown waits for active scheduled work.
 For always-on operation, keep the service running under your process supervisor.
@@ -300,7 +311,7 @@ remain supported in code for remote access: a non-local binding requires a
 bearer token, and remote exposure should use HTTPS through a reverse proxy.
 The service does not commit or push archives automatically.
 
-To preview or email the saved brief after `POST /brief`:
+To preview or email the saved brief after a successful refresh:
 
 ```bash
 .venv/bin/python send_email.py --preview
@@ -342,9 +353,9 @@ before running standalone commands against the same output files.
   envelope to `output/daily_brief_input.json`. It then calls Azure generation,
   writes validated content, and renders/sends the email (or writes a preview).
   The `gather()` and `run()` Python functions still support collection alone.
-- **`service.py`** - long-running cron collection plus REST endpoints for
-  initialization, independent source collection, stored-data brief generation,
-  email delivery, and service health. Scheduling and endpoints reuse the same
+- **`service.py`** - long-running cron collection and brief generation, plus REST
+  endpoints for initialization, independent source collection, manual refresh,
+  saved brief reads, email delivery, and service health. Scheduling and endpoints reuse the same
   collection, generation, rendering, and SMTP implementations as the CLI.
 - **`generate_brief.py`** - reads stored messages and PDFs. New or changed
   PDFs are transcribed by Azure using extracted text and rendered page images,
