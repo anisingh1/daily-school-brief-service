@@ -7,14 +7,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from secrets import compare_digest
 from threading import Lock
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo
 
 import uvicorn
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.base import BaseTrigger
 from croniter import croniter
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 import daily_brief
@@ -23,6 +23,11 @@ import portal_archive
 import send_email
 
 LOGGER = logging.getLogger(__name__)
+
+
+def format_poll_time(timestamp: datetime) -> str:
+    local_time = timestamp.astimezone(portal_archive.IST)
+    return f"{local_time.day} {local_time.strftime('%b %Y %I:%M:%S %p')}"
 
 
 class MessageCronTrigger(BaseTrigger):
@@ -80,12 +85,12 @@ def create_app() -> FastAPI:
             data = daily_brief.run()
             summary = prepare_storage(data)
             application.state.last_poll = {
-                "at": datetime.now(timezone).isoformat(), **summary,
+                "at": format_poll_time(datetime.now(timezone)), **summary,
             }
             LOGGER.info("Scheduled collection completed: %s", summary["messages"])
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001
             application.state.last_poll = {
-                "at": datetime.now(timezone).isoformat(), "error": type(error).__name__,
+                "at": format_poll_time(datetime.now(timezone)), "error": type(error).__name__,
             }
             LOGGER.error("Scheduled collection failed (%s)", type(error).__name__)
         finally:
@@ -106,7 +111,13 @@ def create_app() -> FastAPI:
     application.state.scheduler = scheduler
     application.state.last_poll = None
 
-    def authorize(credentials: HTTPAuthorizationCredentials | None = Depends(HTTPBearer(auto_error=False))) -> None:
+    @application.get("/favicon.ico", include_in_schema=False, status_code=204)
+    def favicon() -> Response:
+        return Response(status_code=204)
+
+    def authorize(
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(HTTPBearer(auto_error=False))],
+    ) -> None:
         if token and (credentials is None or not compare_digest(credentials.credentials, token)):
             raise HTTPException(status_code=401, detail="A valid bearer token is required",
                                 headers={"WWW-Authenticate": "Bearer"})
@@ -118,7 +129,7 @@ def create_app() -> FastAPI:
             "status": "ok", "initialized": portal_archive.ARCHIVE_PATH.exists(),
             "cron": cron, "timezone": str(timezone),
             "retention_days": portal_archive.RETENTION_DAYS,
-            "next_poll": job.next_run_time.isoformat() if job and job.next_run_time else None,
+            "next_poll": format_poll_time(job.next_run_time) if job and job.next_run_time else None,
             "busy": operation_lock.locked(), "last_poll": application.state.last_poll,
         }
 
@@ -209,7 +220,9 @@ def run() -> None:
     host = os.getenv("SERVICE_HOST", "127.0.0.1")
     if host not in {"127.0.0.1", "localhost", "::1"} and not os.getenv("SERVICE_API_TOKEN", "").strip():
         raise ValueError("Set SERVICE_API_TOKEN before binding outside localhost")
-    uvicorn.run(app, host=host, port=int(os.getenv("SERVICE_PORT", "8000")))
+    reload = os.getenv("SERVICE_RELOAD", "").strip().lower() == "true"
+    uvicorn.run("service:app" if reload else app, host=host,
+                port=int(os.getenv("SERVICE_PORT", "8000")), reload=reload)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,10 @@
             "python": "${workspaceFolder}/.venv/bin/python",
             "cwd": "${workspaceFolder}",
             "envFile": "${workspaceFolder}/.env",
+            "env": {
+                "SERVICE_RELOAD": "true"
+            },
+            "subProcess": true,
             "justMyCode": true
         }
     ]

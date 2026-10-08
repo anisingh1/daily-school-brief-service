@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +30,16 @@ def client(tmp_path, monkeypatch):
         yield test_client
 
 
+def test_favicon_returns_no_content_without_authentication(monkeypatch):
+    monkeypatch.setenv("SERVICE_API_TOKEN", "test-token")
+    application = service.create_app()
+    test_client = TestClient(application)
+    response = test_client.get("/favicon.ico")
+    assert response.status_code == 204
+    assert response.content == b""
+    assert "/favicon.ico" not in application.openapi()["paths"]
+
+
 def test_scheduler_uses_env_cron_and_shuts_down(client):
     scheduler = client.app.state.scheduler
     job = scheduler.get_job("collect_messages")
@@ -42,6 +52,47 @@ def test_scheduler_uses_env_cron_and_shuts_down(client):
     assert result["cron"] == "0 18 * * *"
     assert result["timezone"] == "Asia/Kolkata"
     assert not result["initialized"]
+
+
+@pytest.mark.parametrize(("hour", "expected"), [
+    (0, "8 Oct 2026 12:00:00 AM"),
+    (12, "8 Oct 2026 12:00:00 PM"),
+    (22, "8 Oct 2026 10:00:00 PM"),
+])
+def test_poll_time_uses_twelve_hour_clock(hour, expected):
+    timestamp = datetime(2026, 10, 8, hour, tzinfo=service.portal_archive.IST)
+    assert service.format_poll_time(timestamp) == expected
+
+
+def test_health_formats_next_poll_in_ist(client, monkeypatch):
+    next_poll = datetime(2026, 10, 8, 4, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(client.app.state.scheduler, "get_job",
+                        lambda job_id: SimpleNamespace(next_run_time=next_poll))
+    result = client.get("/health").json()
+    assert result["next_poll"] == "8 Oct 2026 10:00:00 AM"
+    assert result["last_poll"] is None
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_health_formats_last_poll_in_ist(client, monkeypatch, fails):
+    fixed_now = datetime(2026, 10, 7, 20, 45, 12, tzinfo=timezone.utc)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now
+
+    def collect():
+        if fails:
+            raise RuntimeError("Collection failed")
+        return {}
+
+    monkeypatch.setattr(service, "datetime", FixedDatetime)
+    monkeypatch.setattr(service.daily_brief, "run", collect)
+    client.app.state.scheduler.get_job("collect_messages").func()
+    result = client.get("/health").json()
+    assert result["last_poll"]["at"] == "8 Oct 2026 02:15:12 AM"
+    assert ("error" in result["last_poll"]) is fails
 
 
 @pytest.mark.parametrize(("route", "source"), [("/scrape-udt", "portal"), ("/fetch-whatsapp", "whatsapp")])
@@ -72,6 +123,7 @@ def test_source_endpoint_fetches_incrementally(client, monkeypatch, route, sourc
     assert calls == [expected]
     last_run = service.portal_archive.read_last_run if source == "portal" else service.portal_archive.read_whatsapp_last_run
     successful_run = last_run()
+    assert successful_run is not None
     assert successful_run > previous
     assert client.post(route).status_code == 200
     expected = successful_run + timedelta(microseconds=1)
@@ -89,7 +141,7 @@ def test_source_endpoint_fetches_incrementally(client, monkeypatch, route, sourc
 
 @pytest.mark.parametrize(("route", "source"), [("/scrape-udt", "portal"), ("/fetch-whatsapp", "whatsapp")])
 def test_source_endpoint_first_run_uses_retention(client, monkeypatch, route, source):
-    cutoff = datetime(2026, 10, 8, 10)
+    cutoff = datetime(2026, 10, 8, 10, tzinfo=service.portal_archive.IST).replace(tzinfo=None)
     monkeypatch.setattr(service.portal_archive, "retention_cutoff", lambda *args: cutoff)
     calls = []
 
@@ -106,7 +158,7 @@ def test_source_endpoint_first_run_uses_retention(client, monkeypatch, route, so
 
 @pytest.mark.parametrize(("route", "source"), [("/scrape-udt", "portal"), ("/fetch-whatsapp", "whatsapp")])
 def test_source_archive_failure_preserves_cursor(client, monkeypatch, route, source):
-    previous = datetime(2026, 10, 8, 10)
+    previous = datetime(2026, 10, 8, 10, tzinfo=service.portal_archive.IST).replace(tzinfo=None)
     service.portal_archive.save_last_run(previous)
     service.portal_archive.save_whatsapp_last_run(previous)
     fetch_name = "fetch_recent_messages" if source == "portal" else "fetch_recent_whatsapp_messages"
@@ -124,7 +176,7 @@ def test_source_archive_failure_preserves_cursor(client, monkeypatch, route, sou
 
 @pytest.mark.parametrize(("route", "source"), [("/scrape-udt", "portal"), ("/fetch-whatsapp", "whatsapp")])
 def test_source_endpoint_failure_preserves_cursor(client, monkeypatch, route, source):
-    previous = datetime(2026, 10, 8, 10)
+    previous = datetime(2026, 10, 8, 10, tzinfo=service.portal_archive.IST).replace(tzinfo=None)
     service.portal_archive.save_last_run(previous)
     service.portal_archive.save_whatsapp_last_run(previous)
 
@@ -373,7 +425,7 @@ def test_failed_poll_releases_lock_and_can_retry(client, monkeypatch):
     poll()
     assert not client.app.state.operation_lock.locked()
     assert client.get("/health").json()["last_poll"]["error"] == "RuntimeError"
-    monkeypatch.setattr(service.daily_brief, "run", lambda: {})
+    monkeypatch.setattr(service.daily_brief, "run", dict)
     poll()
     assert "error" not in client.get("/health").json()["last_poll"]
 
@@ -389,6 +441,19 @@ def test_api_token_is_required_when_configured(monkeypatch):
         assert client.post("/fetch-whatsapp").status_code == 401
         assert client.post("/email-brief").status_code == 401
         assert client.get("/health", headers={"Authorization": "Bearer test-token"}).status_code == 200
+
+
+@pytest.mark.parametrize("reload_enabled", [False, True])
+def test_service_run_configures_reload(monkeypatch, reload_enabled):
+    monkeypatch.setenv("SERVICE_HOST", "127.0.0.1")
+    monkeypatch.setenv("SERVICE_PORT", "8123")
+    monkeypatch.setenv("SERVICE_RELOAD", "true" if reload_enabled else "false")
+    calls = []
+    monkeypatch.setattr(service.uvicorn, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
+    service.run()
+    assert calls == [(("service:app" if reload_enabled else service.app,), {
+        "host": "127.0.0.1", "port": 8123, "reload": reload_enabled,
+    })]
 
 
 def test_public_binding_requires_authentication(monkeypatch):

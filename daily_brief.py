@@ -56,9 +56,13 @@ def gather(initialize: bool = False, source: Literal["portal", "whatsapp"] | Non
 
     try:
         if source in (None, "portal"):
-            portal_cutoff = datetime.min if initialize else compute_portal_cutoff()  # noqa: DTZ901 - portal timestamps are naive
-            if source == "portal" and not initialize and portal_archive.read_last_run() is not None:
-                portal_cutoff += timedelta(microseconds=1)
+            portal_cutoff = portal_archive.retention_cutoff(run_started_at) if initialize else compute_portal_cutoff()
+            if source == "portal" and not initialize:
+                last_portal_run = portal_archive.read_last_run()
+                if last_portal_run is not None and last_portal_run.tzinfo is not None:
+                    last_portal_run = last_portal_run.astimezone(portal_archive.IST).replace(tzinfo=None)
+                if last_portal_run == portal_cutoff:
+                    portal_cutoff += timedelta(microseconds=1)
             new_messages = fetch_recent_messages(cutoff=portal_cutoff, download_attachments=True)
             full_archive = merge_into_archive(new_messages)
             pruned_archive = prune_archive(full_archive)
@@ -71,9 +75,11 @@ def gather(initialize: bool = False, source: Literal["portal", "whatsapp"] | Non
     try:
         if source in (None, "whatsapp"):
             last_run = None if initialize else portal_archive.read_whatsapp_last_run()
-            whatsapp_cutoff = last_run + timedelta(microseconds=1) if last_run else portal_archive.retention_cutoff(run_started_at)
-            if whatsapp_cutoff.tzinfo is None:
-                whatsapp_cutoff = whatsapp_cutoff.replace(tzinfo=portal_archive.IST)
+            whatsapp_cutoff = portal_archive.retention_cutoff(run_started_at).replace(tzinfo=portal_archive.IST)
+            if last_run is not None:
+                if last_run.tzinfo is None:
+                    last_run = last_run.replace(tzinfo=portal_archive.IST)
+                whatsapp_cutoff = max(whatsapp_cutoff, last_run + timedelta(microseconds=1))
             new_whatsapp = fetch_recent_whatsapp_messages(cutoff=whatsapp_cutoff)
             whatsapp_archive = portal_archive.merge_into_archive(new_whatsapp, portal_archive.WHATSAPP_ARCHIVE_PATH)
             whatsapp_archive = portal_archive.prune_archive(whatsapp_archive, run_started_at)

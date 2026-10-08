@@ -15,8 +15,8 @@ versions; the current workflow and run instructions are below.
 
 1. Start the REST service and call `POST /initialize` to populate local storage.
 2. The in-process cron scheduler collects messages on the configured schedule.
-  Each source uses its own last successful fetch cursor, with the retention
-  window as the first-run fallback. Both sources are merged into local JSON archives.
+  Each source uses its own last successful fetch cursor within the configured
+  lookback window. Both sources are merged into local JSON archives.
 3. Missing PDFs are downloaded. New or changed PDFs are transcribed with Azure
   using extracted text and page images. Full-page transcriptions are cached by
   file hash and extraction version, so unchanged PDFs are not uploaded again.
@@ -93,6 +93,11 @@ MESSAGE_POLL_TIMEZONE=Asia/Kolkata
 ARCHIVE_RETENTION_DAYS=35
 ```
 
+`ARCHIVE_RETENTION_DAYS` controls both how far back initialization, scheduled
+collection, source endpoints, and the full CLI pipeline fetch UDT and WhatsApp
+messages, and how long stored data is retained. For example, set it to `7` to
+fetch and retain at most seven days. Restart the service after changing `.env`.
+
 `MESSAGE_POLL_CRON` is a standard five-field cron expression (minute, hour,
 day of month, month, day of week). For example, `0 18 * * *` collects at
 18:00 daily. Numeric weekday `0`/`7` means Sunday, and day-of-month and
@@ -100,17 +105,18 @@ day-of-week restrictions use standard cron OR semantics. Restart the service
 after changing configuration. It polls only while the process is running;
 there is no OS cron installation or automatic startup configuration.
 
-Initialize storage once after starting, or repeat safely to refresh all
-portal messages that the school's activity page currently exposes:
+Initialize storage once after starting, or repeat safely to refresh messages
+within the configured lookback window:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/initialize
 ```
 
-This ignores the portal cursor, reads every exposed message, downloads missing
+This ignores both source cursors, filters exposed messages to the lookback
+window before saving attachments, downloads missing
 PDFs while reusing existing files in `data/pdfs/`, and creates the message JSON
 archives and cached PDF transcriptions. It also collects captured WhatsApp
-messages within the retention window. Older messages/PDFs are removed by
+messages within the same lookback window. Older messages/PDFs are removed by
 retention cleanup, even during initialization. It does not generate a brief
 or send email. The response reports retained message/document counts and warnings.
 The portal currently exposes one activity page; unavailable historical messages
@@ -136,8 +142,8 @@ curl -X POST http://127.0.0.1:8000/fetch-whatsapp
 ```
 
 Each endpoint fetches messages strictly newer than that source's last successful
-collection start time. Without a saved cursor, it uses the configured retention
-window. Messages and attachments are saved locally and PDF caches are prepared;
+collection start time, bounded by the configured lookback window. Without a
+saved cursor, it uses that window directly. Messages and attachments are saved locally and PDF caches are prepared;
 neither endpoint generates a brief or sends email. The response includes retained
 message counts, PDF document counts, and warnings. The other source is not fetched.
 Cursors advance only after successful fetching and archive persistence, so failed
@@ -217,11 +223,11 @@ before running standalone commands against the same output files.
   via IMAP using the same Gmail App Password as `send_email.py` (no
   Google Cloud project or service account), filtered to the same
   rolling lookback window (standalone) or its saved cursor in the service,
-  falling back to retention on first use (35 days by default). PDF attachments are saved to `data/pdfs/`
+  bounded by `ARCHIVE_RETENTION_DAYS` (35 days by default). PDF attachments are saved to `data/pdfs/`
   (prefixed `whatsapp_`); other attachment types are ignored.
 - **`portal_archive.py`** - persists portal and WhatsApp message archives
   as local JSON, plus each source's last successful fetch cursor. New
-  messages are fetched since their cursor, or within retention on first use.
+  messages are fetched since their cursor, bounded by the retention window.
   WhatsApp messages are deduplicated by their captured message content.
   Both archives, PDFs, extracted PDF text, and saved outputs are cleaned up
   locally without a database.
@@ -261,7 +267,7 @@ before running standalone commands against the same output files.
 These are alternatives to the service workflow. Stop the service before
 running collection, generation, or cleanup commands against the same storage.
 Standalone fetchers use a built-in 36-hour lookback; the service and full
-pipeline use their explicit cursor and retention cutoffs instead.
+pipeline use their explicit cursor and `ARCHIVE_RETENTION_DAYS` cutoffs instead.
 
 - Portal scraper only (saves messages + downloads PDFs):
   ```

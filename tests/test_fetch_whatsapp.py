@@ -171,6 +171,33 @@ def test_fetch_recent_whatsapp_messages_parses_imap_search_results(monkeypatch, 
     assert fake_conn.logged_out is True
 
 
+def test_fetch_skips_attachment_parsing_before_exact_cutoff(monkeypatch):
+    import fetch_whatsapp
+
+    msg = EmailMessage()
+    msg["Date"] = "Tue, 01 Sep 2026 10:00:00 +0530"
+    msg.set_content("Old notice")
+    msg.add_attachment(b"old pdf", maintype="application", subtype="pdf", filename="old.pdf")
+
+    class FakeConn:
+        def search(self, charset, *criteria):
+            return "OK", [b"42"]
+
+        def fetch(self, uid, parts):
+            return "OK", [(b"42 (RFC822 {n}", msg.as_bytes())]
+
+        def logout(self):
+            pass
+
+    def unexpected_parse(*args):
+        raise AssertionError("Older email must not parse or save attachments")
+
+    monkeypatch.setattr(fetch_whatsapp, "_connect_imap", FakeConn)
+    monkeypatch.setattr(fetch_whatsapp, "parse_email_message", unexpected_parse)
+    cutoff = datetime.fromisoformat("2026-09-01T12:00:00+05:30")
+    assert fetch_whatsapp.fetch_recent_whatsapp_messages(cutoff=cutoff) == []
+
+
 def test_filter_recent_uses_explicit_cutoff_over_lookback_hours():
     from fetch_whatsapp import filter_recent
 

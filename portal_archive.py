@@ -1,7 +1,7 @@
 """Store portal and WhatsApp messages for the configured retention window.
 
-The portal cursor limits fetching to new messages. On first use, fetch
-the full retention window. Cleanup uses message timestamps in IST for
+Source cursors limit fetching to new messages within the retention window.
+Cleanup uses message timestamps in IST for
 archives and referenced PDFs, and modification times for orphaned files.
 Run this module directly for cleanup without fetching or generating a brief.
 """
@@ -57,9 +57,12 @@ def save_whatsapp_last_run(dt: datetime) -> None:
 
 def compute_portal_cutoff() -> datetime:
     last_run = read_last_run()
+    cutoff = retention_cutoff()
     if last_run is not None:
-        return last_run
-    return retention_cutoff()
+        if last_run.tzinfo is not None:
+            last_run = last_run.astimezone(IST).replace(tzinfo=None)
+        return max(last_run, cutoff)
+    return cutoff
 
 
 def load_archive(path: Path | None = None) -> list[dict]:

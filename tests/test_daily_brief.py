@@ -6,21 +6,47 @@ import daily_brief
 import portal_archive
 
 
-def test_initialization_scans_all_portal_messages_ignoring_cursor(monkeypatch):
+def test_initialization_uses_configured_lookback_ignoring_cursors(monkeypatch):
     from datetime import datetime
 
     calls = {}
+    cutoff = datetime(2026, 10, 1, 12)
+    monkeypatch.setattr(portal_archive, "retention_cutoff", lambda *args: cutoff)
     monkeypatch.setattr(daily_brief, "compute_portal_cutoff", lambda: pytest.fail("Cursor should not limit initialization"))
+    monkeypatch.setattr(portal_archive, "read_whatsapp_last_run", lambda: pytest.fail("Cursor should not limit initialization"))
 
     def fetch(**kwargs):
         calls.update(kwargs)
         return []
 
     monkeypatch.setattr(daily_brief, "fetch_recent_messages", fetch)
-    monkeypatch.setattr(daily_brief, "fetch_recent_whatsapp_messages", lambda **kwargs: [])
+    whatsapp_calls = []
+    monkeypatch.setattr(daily_brief, "fetch_recent_whatsapp_messages", lambda **kwargs: whatsapp_calls.append(kwargs["cutoff"]) or [])
     result = daily_brief.gather(initialize=True)
-    assert calls == {"cutoff": datetime.min, "download_attachments": True}
+    assert calls == {"cutoff": cutoff, "download_attachments": True}
+    assert whatsapp_calls == [cutoff.replace(tzinfo=portal_archive.IST)]
     assert result["portal"]["error"] is None
+
+
+@pytest.mark.parametrize("source", ["portal", "whatsapp"])
+def test_collection_caps_stale_cursor_at_lookback(source, monkeypatch):
+    from datetime import datetime, timedelta
+
+    now = datetime.now(portal_archive.IST).replace(tzinfo=None)
+    cutoff = now - timedelta(days=7)
+    monkeypatch.setattr(portal_archive, "retention_cutoff", lambda *args: cutoff)
+    portal_archive.save_last_run(now - timedelta(days=90))
+    portal_archive.save_whatsapp_last_run(now - timedelta(days=90))
+    calls = []
+    fetch = lambda **kwargs: calls.append(kwargs["cutoff"]) or []
+    monkeypatch.setattr(daily_brief, "fetch_recent_messages", fetch)
+    monkeypatch.setattr(daily_brief, "fetch_recent_whatsapp_messages", fetch)
+    result = daily_brief.gather(source=source)
+    if source == "portal":
+        assert calls == [cutoff]
+    else:
+        assert calls == [cutoff.replace(tzinfo=portal_archive.IST)]
+    assert result[source]["error"] is None
 
 
 @pytest.fixture(autouse=True)

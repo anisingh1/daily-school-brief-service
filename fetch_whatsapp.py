@@ -166,6 +166,9 @@ def fetch_recent_whatsapp_messages(
             _, msg_data = conn.fetch(uid, "(RFC822)")
             raw = msg_data[0][1]
             msg = email.message_from_bytes(raw)
+            timestamp = parsedate_to_datetime(msg.get("Date", "")).isoformat()
+            if not filter_recent([{"timestamp": timestamp}], cutoff=cutoff):
+                continue
             messages.append(parse_email_message(msg, uid.decode()))
     finally:
         conn.logout()

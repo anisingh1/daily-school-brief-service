@@ -59,6 +59,7 @@ def test_save_and_read_last_run_roundtrip(tmp_path, monkeypatch):
 def test_compute_portal_cutoff_uses_last_run_when_present(monkeypatch):
     saved = datetime(2026, 9, 4, 19, 30)
     monkeypatch.setattr(portal_archive, "read_last_run", lambda: saved)
+    monkeypatch.setattr(portal_archive, "retention_cutoff", lambda: datetime(2026, 9, 1))
     assert portal_archive.compute_portal_cutoff() == saved
 
 
@@ -67,6 +68,17 @@ def test_compute_portal_cutoff_falls_back_to_retention_when_absent(monkeypatch):
     cutoff = datetime(2026, 9, 2)
     monkeypatch.setattr(portal_archive, "retention_cutoff", lambda: cutoff)
     assert portal_archive.compute_portal_cutoff() == cutoff
+
+
+@pytest.mark.parametrize("days", [1, 7, 60])
+def test_fetch_window_uses_retention_days(monkeypatch, days):
+    monkeypatch.setenv("ARCHIVE_RETENTION_DAYS", str(days))
+    monkeypatch.setattr(portal_archive, "RETENTION_DAYS", portal_archive._read_retention_days())
+    monkeypatch.setattr(portal_archive, "read_last_run", lambda: None)
+    now = datetime(2026, 10, 8, 12, tzinfo=portal_archive.IST)
+    assert portal_archive.retention_cutoff(now) == now.replace(tzinfo=None) - timedelta(days=days)
+    expected = portal_archive.retention_cutoff()
+    assert abs(portal_archive.compute_portal_cutoff() - expected) < timedelta(seconds=1)
 
 
 def test_retention_boundary_and_timezone():
