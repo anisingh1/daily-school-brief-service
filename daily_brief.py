@@ -2,20 +2,13 @@
 Collects school messages, generates a validated brief with Azure OpenAI,
 and renders/sends it using the existing email scripts.
 
-Each source is best-effort: if one fails, its `error` field is set and
-`messages` is empty, so Azure can still produce a partial brief
-rather than nothing.
-
-WhatsApp always uses cutoff.month_anchor() (its Drive log already
-retains its own full history, so re-scanning the current month is
-enough, and it stays intentionally decoupled from the portal's cursor).
-The portal uses portal_archive.py's cursor-or-month-anchor cutoff, merges
-newly-fetched messages into the git-committed archive
-(data/portal_messages.json), and always returns the FULL merged archive
-here - not just the newest fetch - so nothing scraped in the past is
-ever missed. The cursor (data/last_run.json) and archive are only
-updated when the portal fetch itself succeeds. Portal attachments are
-downloaded into data/pdfs/ (skipping already-downloaded files).
+Each source is best-effort: on failure, its `error` field is set and
+retained local messages are still used. Both sources are stored as JSON
+archives under data/ and attachments are downloaded into data/pdfs/.
+The portal uses its last successful fetch cursor; WhatsApp scans the
+35-day retention window. Cleanup runs before and after collection, even
+when a fetch fails, and before reusing saved input. The brief uses the
+merged retained messages, not just the latest fetch.
 
 Note: data/ must be committed and pushed after this runs for the
 archive/cursor to persist across a scheduled cloud routine's fresh
@@ -39,10 +32,16 @@ from typing import Any, TypedDict
 
 import commit_archive
 import generate_brief
+import portal_archive
 import send_email
-from cutoff import month_anchor
 from fetch_whatsapp import fetch_recent_whatsapp_messages
-from portal_archive import compute_portal_cutoff, merge_into_archive, prune_archive, save_archive, save_last_run
+from portal_archive import (
+    compute_portal_cutoff,
+    merge_into_archive,
+    prune_archive,
+    save_archive,
+    save_last_run,
+)
 from scrape_udt import fetch_recent_messages
 
 OUTPUT_PATH = Path(__file__).parent / "output" / "daily_brief_input.json"
@@ -53,15 +52,16 @@ class SourceResult(TypedDict):
     error: str | None
 
 
-def gather() -> dict[str, SourceResult]:
-    run_started_at = datetime.now()  # noqa: DTZ005 - naive on purpose: fetch_recent_messages compares it against naive portal timestamps; fetch_recent_whatsapp_messages attaches tz itself when needed
+def gather(initialize: bool = False) -> dict[str, SourceResult]:
+    run_started_at = datetime.now(portal_archive.IST).replace(tzinfo=None)
+    stored = portal_archive.cleanup_stored_data(run_started_at)
     result: dict[str, SourceResult] = {
-        "portal": {"messages": [], "error": None},
-        "whatsapp": {"messages": [], "error": None},
+        "portal": {"messages": stored["portal"], "error": None},
+        "whatsapp": {"messages": stored["whatsapp"], "error": None},
     }
 
     try:
-        portal_cutoff = compute_portal_cutoff()
+        portal_cutoff = datetime.min if initialize else compute_portal_cutoff()  # noqa: DTZ901 - portal timestamps are naive
         new_messages = fetch_recent_messages(cutoff=portal_cutoff, download_attachments=True)
         full_archive = merge_into_archive(new_messages)
         pruned_archive = prune_archive(full_archive)
@@ -72,19 +72,23 @@ def gather() -> dict[str, SourceResult]:
         result["portal"]["error"] = f"{type(e).__name__}: {e}"
 
     try:
-        result["whatsapp"]["messages"] = fetch_recent_whatsapp_messages(
-            cutoff=month_anchor(months_back=3)
+        new_whatsapp = fetch_recent_whatsapp_messages(
+            cutoff=portal_archive.retention_cutoff(run_started_at).replace(tzinfo=portal_archive.IST)
         )
+        whatsapp_archive = portal_archive.merge_into_archive(new_whatsapp, portal_archive.WHATSAPP_ARCHIVE_PATH)
+        whatsapp_archive = portal_archive.prune_archive(whatsapp_archive, run_started_at)
+        portal_archive.save_archive(whatsapp_archive, portal_archive.WHATSAPP_ARCHIVE_PATH)
+        result["whatsapp"]["messages"] = whatsapp_archive
     except Exception as e:  # noqa: BLE001 - best-effort per source, see module docstring
         result["whatsapp"]["error"] = f"{type(e).__name__}: {e}"
 
+    portal_archive.cleanup_stored_data(run_started_at)
     return result
 
 
-def run():
-    data = gather()
-    OUTPUT_PATH.parent.mkdir(exist_ok=True)
-    OUTPUT_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+def run(initialize: bool = False):
+    data = gather(initialize=True) if initialize else gather()
+    portal_archive.write_json(OUTPUT_PATH, data)
     print(f"Wrote {OUTPUT_PATH}")
     return data
 
@@ -96,18 +100,21 @@ def run_pipeline(preview: bool = False, from_input: bool = False, persist_archiv
     succeeded = True
     try:
         if from_input:
+            portal_archive.cleanup_stored_data(now)
             data = json.loads(OUTPUT_PATH.read_text(encoding="utf-8"))
         else:
             data = run()
-        if persist_archive and not from_input:
-            output = io.StringIO()
-            with redirect_stdout(output):
-                commit_archive.commit_and_push()
-            print(output.getvalue(), end="")
-            if "WARNING:" in output.getvalue():
-                warnings.append("Archive changes could not be pushed; the next fresh-clone run may miss today's update.")
-        content = generate_brief.generate(data, now=now)
-    except Exception as error:
+        try:
+            content = generate_brief.generate(data, now=now)
+        finally:
+            if persist_archive and not from_input:
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    commit_archive.commit_and_push()
+                print(output.getvalue(), end="")
+                if "WARNING:" in output.getvalue():
+                    warnings.append("Archive changes could not be pushed; the next fresh-clone run may miss today's update.")
+    except Exception as error:  # noqa: BLE001 - pipeline failures must produce a warning-only brief
         succeeded = False
         status_code = getattr(error, "status_code", None)
         reason = type(error).__name__

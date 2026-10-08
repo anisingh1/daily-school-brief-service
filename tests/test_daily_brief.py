@@ -3,6 +3,33 @@ import json
 import pytest
 
 import daily_brief
+import portal_archive
+
+
+def test_initialization_scans_all_portal_messages_ignoring_cursor(monkeypatch):
+    from datetime import datetime
+
+    calls = {}
+    monkeypatch.setattr(daily_brief, "compute_portal_cutoff", lambda: pytest.fail("Cursor should not limit initialization"))
+
+    def fetch(**kwargs):
+        calls.update(kwargs)
+        return []
+
+    monkeypatch.setattr(daily_brief, "fetch_recent_messages", fetch)
+    monkeypatch.setattr(daily_brief, "fetch_recent_whatsapp_messages", lambda **kwargs: [])
+    result = daily_brief.gather(initialize=True)
+    assert calls == {"cutoff": datetime.min, "download_attachments": True}
+    assert result["portal"]["error"] is None
+
+
+@pytest.fixture(autouse=True)
+def isolated_storage(tmp_path, monkeypatch):
+    monkeypatch.setattr(portal_archive, "DATA_DIR", tmp_path / "data")
+    monkeypatch.setattr(portal_archive, "ARCHIVE_PATH", tmp_path / "data" / "portal_messages.json")
+    monkeypatch.setattr(portal_archive, "WHATSAPP_ARCHIVE_PATH", tmp_path / "data" / "whatsapp_messages.json")
+    monkeypatch.setattr(portal_archive, "LAST_RUN_PATH", tmp_path / "data" / "last_run.json")
+    monkeypatch.setattr(portal_archive, "OUTPUT_DIR", tmp_path / "output")
 
 
 def test_gather_captures_portal_error(monkeypatch):
@@ -18,6 +45,43 @@ def test_gather_captures_portal_error(monkeypatch):
     assert result["portal"]["error"] == "RuntimeError: login failed"
     assert result["portal"]["messages"] == []
     assert result["whatsapp"]["error"] is None
+
+
+def test_gather_reuses_stored_messages_and_cleans_up_when_fetches_fail(monkeypatch):
+    from datetime import datetime, timedelta
+
+    now = datetime.now(portal_archive.IST)
+    recent_portal = {"id": "recent", "posted_at": now.isoformat(), "attachments": []}
+    old_portal = {"id": "old", "posted_at": (now - timedelta(days=36)).isoformat(), "attachments": []}
+    recent_whatsapp = {"timestamp": now.isoformat(), "text": "stored", "attachments": []}
+    portal_archive.save_archive([recent_portal, old_portal])
+    portal_archive.save_archive([recent_whatsapp], portal_archive.WHATSAPP_ARCHIVE_PATH)
+
+    def failing_fetch(**kwargs):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(daily_brief, "fetch_recent_messages", failing_fetch)
+    monkeypatch.setattr(daily_brief, "fetch_recent_whatsapp_messages", failing_fetch)
+    result = daily_brief.gather()
+    assert result["portal"]["messages"] == [recent_portal]
+    assert result["whatsapp"]["messages"] == [recent_whatsapp]
+    assert result["portal"]["error"] == "RuntimeError: offline"
+    assert result["whatsapp"]["error"] == "RuntimeError: offline"
+    assert portal_archive.load_archive() == [recent_portal]
+
+
+def test_gather_stores_and_reuses_downloaded_sources(monkeypatch):
+    from datetime import datetime
+
+    now = datetime.now(portal_archive.IST).isoformat()
+    portal = {"id": "1", "posted_at": now, "body": "Homework", "attachments": []}
+    whatsapp = {"timestamp": now, "sender": "School", "text": "Notice", "attachments": []}
+    monkeypatch.setattr(daily_brief, "fetch_recent_messages", lambda **kwargs: [portal])
+    monkeypatch.setattr(daily_brief, "fetch_recent_whatsapp_messages", lambda **kwargs: [whatsapp])
+    result = daily_brief.gather()
+    assert result["portal"]["messages"] == portal_archive.load_archive() == [portal]
+    assert result["whatsapp"]["messages"] == portal_archive.load_archive(portal_archive.WHATSAPP_ARCHIVE_PATH) == [whatsapp]
+    assert daily_brief.gather() == result
 
 
 def test_gather_merges_and_saves_archive_on_portal_success(monkeypatch):
@@ -96,8 +160,8 @@ def test_gather_captures_whatsapp_error(monkeypatch):
     assert result["portal"]["error"] is None
 
 
-def test_gather_uses_month_anchor_for_whatsapp_cutoff(monkeypatch):
-    from cutoff import month_anchor as real_month_anchor
+def test_gather_uses_35_day_whatsapp_cutoff(monkeypatch):
+    from datetime import datetime, timedelta
 
     calls = {}
 
@@ -114,7 +178,7 @@ def test_gather_uses_month_anchor_for_whatsapp_cutoff(monkeypatch):
 
     daily_brief.gather()
 
-    assert calls["cutoff"] == real_month_anchor(months_back=3)
+    assert abs((datetime.now(portal_archive.IST) - calls["cutoff"]) - timedelta(days=35)) < timedelta(seconds=2)
 
 
 def test_gather_uses_portal_cutoff_and_downloads_attachments(monkeypatch):
@@ -210,7 +274,7 @@ def test_pipeline_replaces_stale_content_with_warning_and_still_delivers(monkeyp
     def fail(*args, **kwargs):
         raise RuntimeError("sensitive detail that should not be emailed")
     monkeypatch.setattr(daily_brief, "run", fail if stage == "collect" else lambda: data)
-    monkeypatch.setattr(daily_brief.generate_brief, "generate", fail if stage == "generate" else lambda *args, **kwargs: pytest.fail("Unexpected generation"))
+    monkeypatch.setattr(daily_brief.generate_brief, "generate", fail if stage == "generate" else lambda *args, **kwargs: daily_brief.generate_brief.empty_brief("date", []))
     monkeypatch.setattr(daily_brief.commit_archive, "commit_and_push", fail if stage == "archive" else lambda: pytest.fail("Unexpected commit"))
     sent = []
     monkeypatch.setattr(daily_brief.send_email, "run", lambda preview: sent.append(preview))
@@ -231,3 +295,22 @@ def test_pipeline_includes_recoverable_archive_warning(monkeypatch, tmp_path):
     assert daily_brief.run_pipeline(preview=True, persist_archive=True)
     result = json.loads((tmp_path / "content.json").read_text())
     assert "could not be pushed" in result["warnings"][0]
+
+
+@pytest.mark.parametrize("generation_fails", [False, True])
+def test_archive_commit_runs_after_generation_even_on_failure(monkeypatch, tmp_path, generation_fails):
+    monkeypatch.setattr(daily_brief.generate_brief, "CONTENT_PATH", tmp_path / "content.json")
+    monkeypatch.setattr(daily_brief, "run", lambda: {})
+    calls = []
+
+    def generate(*args, **kwargs):
+        calls.append("generate")
+        if generation_fails:
+            raise RuntimeError("failed")
+        return daily_brief.generate_brief.empty_brief("date", [])
+
+    monkeypatch.setattr(daily_brief.generate_brief, "generate", generate)
+    monkeypatch.setattr(daily_brief.commit_archive, "commit_and_push", lambda: calls.append("commit"))
+    monkeypatch.setattr(daily_brief.send_email, "run", lambda preview: calls.append("send"))
+    assert daily_brief.run_pipeline(persist_archive=True) is not generation_fails
+    assert calls == ["generate", "commit", "send"]

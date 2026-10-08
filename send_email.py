@@ -7,6 +7,8 @@ script reads that file, renders it into HTML via render_email.py, and
 sends it - keeping "what to say" (Azure GPT's judgment),
 "how it looks" (render_email.py), and "how to send it" (this module)
 as separate concerns.
+The rendered HTML is saved as a preview before delivery so an SMTP failure
+does not require regenerating the brief.
 
 SETUP:
     - Create a Gmail App Password: Google Account -> Security -> 2-Step
@@ -23,6 +25,7 @@ USAGE:
 import json
 import os
 import smtplib
+import ssl
 import sys
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -67,7 +70,18 @@ def send_brief_email(subject: str, html_body: str) -> None:
     msg["To"] = ", ".join(recipients)
     msg.attach(MIMEText(html_body, "html"))
 
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+    try:
+        connection = smtplib.SMTP_SSL(
+            SMTP_HOST, SMTP_PORT, timeout=30, context=ssl.create_default_context()
+        )
+    except (OSError, smtplib.SMTPServerDisconnected) as error:
+        raise RuntimeError(
+            f"Could not establish a secure SMTP connection to {SMTP_HOST}:{SMTP_PORT} "
+            f"({type(error).__name__}); Gmail login was not reached. "
+            "Check network/VPN/firewall access to SMTP, then retry python send_email.py "
+            "without regenerating the brief."
+        ) from error
+    with connection as server:
         server.login(SMTP_USERNAME, SMTP_APP_PASSWORD)
         server.sendmail(SMTP_USERNAME, recipients, msg.as_string())
 
@@ -75,8 +89,9 @@ def send_brief_email(subject: str, html_body: str) -> None:
 def run(preview: bool = False) -> None:
     data = json.loads(CONTENT_PATH.read_text())
     html = render_brief_html(data)
+    PREVIEW_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PREVIEW_PATH.write_text(html)
     if preview:
-        PREVIEW_PATH.write_text(html)
         print(f"Preview written to {PREVIEW_PATH}")
         return
     subject = f"Daily School Brief - {data.get('date', '')}"

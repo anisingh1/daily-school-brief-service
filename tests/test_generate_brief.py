@@ -65,6 +65,76 @@ def test_pdf_text_and_errors_are_included_without_changing_sources(monkeypatch, 
     assert json.dumps(data) == before
 
 
+def test_generation_reuses_pdf_cache_and_invalidates_changed_content(monkeypatch, tmp_path):
+    monkeypatch.setattr(generate_brief, "ROOT", tmp_path)
+    monkeypatch.setattr(generate_brief, "PDF_DIR", tmp_path / "data" / "pdfs")
+    pdf_dir = generate_brief.PDF_DIR
+    pdf_dir.mkdir(parents=True)
+    pdf_path = pdf_dir / "planner.pdf"
+
+    def save_pdf(text):
+        with pymupdf.open() as document:
+            page = document.new_page()
+            page.insert_text((72, 72), text)
+            document.save(pdf_path)
+
+    save_pdf("November 1: Aviraj brings a workbook")
+    data = {"portal": {"messages": [{"body": "Planner", "attachments": [
+        {"saved_as": str(pdf_path)},
+    ]}], "error": None}}
+    requests = []
+    brief = generate_brief.empty_brief("date", []).model_dump()
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        if kwargs["response_format"]["json_schema"]["name"] == "pdf_text":
+            assert any(part["type"] == "image_url" for part in kwargs["messages"][1]["content"])
+            extracted = {"pages": [{"page": 1, "text": "November 1: Aviraj brings a workbook"}], "warnings": []}
+            content = json.dumps(extracted)
+        else:
+            assert all(part["type"] == "text" for part in kwargs["messages"][1]["content"])
+            assert "November 1" in kwargs["messages"][1]["content"][0]["text"]
+            content = json.dumps(brief)
+        return SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="stop", message=SimpleNamespace(refusal=None, content=content),
+        )])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)), close=lambda: None)
+    monkeypatch.setattr(generate_brief, "create_client", lambda: (client, "deployment"))
+    generate_brief.generate(data)
+    generate_brief.generate(data)
+    assert [request["response_format"]["json_schema"]["name"] for request in requests] == [
+        "pdf_text", "school_brief", "school_brief",
+    ]
+    cache = next((pdf_dir.parent / "pdf_cache").glob("*.json"))
+    cache.write_text("broken JSON")
+    generate_brief.generate(data)
+    assert len(requests) == 5
+    pdf_path.unlink()
+    save_pdf("Changed planner")
+    generate_brief.generate(data)
+    assert len(requests) == 7
+    monkeypatch.setattr(generate_brief, "PDF_CACHE_VERSION", "v2")
+    generate_brief.generate(data)
+    assert len(requests) == 9
+
+
+@pytest.mark.parametrize("finish_reason, refusal, pages", [
+    ("length", None, [{"page": 1, "text": "partial"}]),
+    ("stop", "refused", [{"page": 1, "text": "partial"}]),
+    ("stop", None, []),
+    ("stop", None, [{"page": 2, "text": "missing first page"}]),
+])
+def test_pdf_extraction_rejects_incomplete_content(finish_reason, refusal, pages):
+    response = SimpleNamespace(choices=[SimpleNamespace(
+        finish_reason=finish_reason,
+        message=SimpleNamespace(refusal=refusal, content=json.dumps({"pages": pages, "warnings": []})),
+    )])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response)))
+    with pytest.raises((RuntimeError, ValueError)):
+        generate_brief.extract_pdf_text(client, "deployment", [{"page": 1, "text": ""}], [])
+
+
 @pytest.mark.parametrize("finish_reason, refusal, invalid", [
     ("stop", None, False), ("length", None, False),
     ("stop", "refused", False), ("stop", None, True),
