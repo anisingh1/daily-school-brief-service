@@ -11,6 +11,7 @@ import service
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
+    monkeypatch.setattr(service.daily_brief, "fetch_attendance", lambda *args: [])
     monkeypatch.setenv("MESSAGE_POLL_CRON", "0 18 * * *")
     monkeypatch.setenv("MESSAGE_POLL_TIMEZONE", "Asia/Kolkata")
     monkeypatch.delenv("SERVICE_API_TOKEN", raising=False)
@@ -397,9 +398,8 @@ def test_poll_updates_both_archives_and_brief_reads_latest_storage(client, monke
     monkeypatch.setattr(service.daily_brief, "fetch_recent_messages", lambda **kwargs: [portal])
     monkeypatch.setattr(service.daily_brief, "fetch_recent_whatsapp_messages", lambda **kwargs: [whatsapp])
     prepared = []
-    monkeypatch.setattr(service, "prepare_storage", lambda data: prepared.append(data) or {
-        "messages": {name: len(source["messages"]) for name, source in data.items()},
-    })
+    prepare_storage = service.prepare_storage
+    monkeypatch.setattr(service, "prepare_storage", lambda data: prepared.append(data) or prepare_storage(data))
     def generate(data, now, **kwargs):
         assert data["portal"]["messages"] == [portal]
         assert data["whatsapp"]["messages"] == [whatsapp]
@@ -422,6 +422,32 @@ def test_poll_updates_both_archives_and_brief_reads_latest_storage(client, monke
     assert response.status_code == 200
     assert response.json()["homework"] == ["New homework"]
     assert response.json()["reminders"] == ["New notice"]
+
+
+@pytest.mark.parametrize("workflow", ["initialize", "refresh", "cron", "scrape-udt"])
+def test_attendance_is_collected_in_all_portal_workflows(client, monkeypatch, workflow):
+    import json
+
+    today = datetime.now(service.portal_archive.IST).date().isoformat()
+    records = [{"date": today, "status": "present"}]
+    calls = []
+    monkeypatch.setattr(service.daily_brief, "fetch_attendance", lambda *args: calls.append(args) or records)
+    monkeypatch.setattr(service.daily_brief, "fetch_recent_messages", lambda **kwargs: [])
+    monkeypatch.setattr(service.daily_brief, "fetch_recent_whatsapp_messages", lambda **kwargs: [])
+    if workflow == "cron":
+        client.app.state.scheduler.get_job("collect_messages").func()
+        summary = client.get("/health").json()["last_poll"]
+    else:
+        response = client.post(f"/{workflow}")
+        assert response.status_code == 200
+        summary = response.json()
+    assert len(calls) == 1
+    assert summary["attendance_records"] == 1
+    saved = json.loads(service.daily_brief.OUTPUT_PATH.read_text())
+    assert saved["attendance"]["records"] == records
+    if workflow in {"refresh", "cron"}:
+        calendar = client.get("/brief").json()["calendar"]
+        assert next(day for day in calendar if day["date"] == today)["attendance"] == "present"
 
 
 @pytest.mark.parametrize("manual", [False, True])

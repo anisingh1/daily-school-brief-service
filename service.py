@@ -65,7 +65,9 @@ def prepare_storage(data: dict[str, Any]) -> dict[str, Any]:
         finally:
             client.close()
     return {
-        "messages": {name: len(source.get("messages", [])) for name, source in data.items()},
+        "messages": {name: len(source.get("messages", [])) for name, source in data.items()
+                     if name != "attendance"},
+        "attendance_records": len(data.get("attendance", {}).get("records", [])),
         "pdf_documents": documents,
         "warnings": list(dict.fromkeys(warnings)),
     }
@@ -184,7 +186,10 @@ def create_app() -> FastAPI:
             data = daily_brief.run(source=source)
             if data[source].get("error"):
                 raise HTTPException(status_code=502, detail=f"{source} collection failed; cursor was not advanced")
-            summary = prepare_storage({source: data[source]})
+            collected: dict[str, Any] = {source: data[source]}
+            if source == "portal" and "attendance" in data:
+                collected["attendance"] = data["attendance"]
+            summary = prepare_storage(collected)
             summary.pop("warnings", None)
             return summary
         except HTTPException:

@@ -21,9 +21,10 @@ USAGE:
 
 import argparse
 import json
+from calendar import monthrange
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 import generate_brief
 import portal_archive
@@ -36,7 +37,7 @@ from portal_archive import (
     save_archive,
     save_last_run,
 )
-from scrape_udt import fetch_recent_messages
+from scrape_udt import fetch_attendance, fetch_recent_messages
 
 OUTPUT_PATH = Path(__file__).parent / "output" / "daily_brief_input.json"
 
@@ -44,6 +45,7 @@ OUTPUT_PATH = Path(__file__).parent / "output" / "daily_brief_input.json"
 class SourceResult(TypedDict):
     messages: list[Any]
     error: str | None
+    records: NotRequired[list[dict]]
 
 
 def gather(initialize: bool = False, source: Literal["portal", "whatsapp"] | None = None) -> dict[str, SourceResult]:
@@ -52,7 +54,23 @@ def gather(initialize: bool = False, source: Literal["portal", "whatsapp"] | Non
     result: dict[str, SourceResult] = {
         "portal": {"messages": stored["portal"], "error": None},
         "whatsapp": {"messages": stored["whatsapp"], "error": None},
+        "attendance": {"messages": [], "records": [], "error": None},
     }
+    attendance_start = min(portal_archive.retention_cutoff(run_started_at), run_started_at.replace(day=1))
+    attendance_end = run_started_at.replace(day=monthrange(run_started_at.year, run_started_at.month)[1])
+    attendance_path = portal_archive.DATA_DIR / "attendance.json"
+    try:
+        if attendance_path.exists():
+            result["attendance"]["records"] = [
+                record for record in json.loads(attendance_path.read_text(encoding="utf-8"))
+                if attendance_start.date().isoformat() <= record["date"] <= attendance_end.date().isoformat()
+            ]
+        if source in (None, "portal"):
+            records = fetch_attendance(attendance_start, attendance_end)
+            portal_archive.write_json(attendance_path, records)
+            result["attendance"]["records"] = records
+    except Exception as error:
+        result["attendance"]["error"] = f"{type(error).__name__}: {error}"
 
     try:
         if source in (None, "portal"):
@@ -102,6 +120,8 @@ def run(initialize: bool = False, source: Literal["portal", "whatsapp"] | None =
         saved_input = json.loads(OUTPUT_PATH.read_text(encoding="utf-8"))
         other_source = "whatsapp" if source == "portal" else "portal"
         data[other_source]["error"] = saved_input.get(other_source, {}).get("error")
+        if source == "whatsapp":
+            data["attendance"]["error"] = saved_input.get("attendance", {}).get("error")
     portal_archive.write_json(OUTPUT_PATH, data)
     print(f"Wrote {OUTPUT_PATH}")
     return data
@@ -130,6 +150,9 @@ def run_pipeline(preview: bool = False, from_input: bool = False) -> bool:
         )
         warnings.append(f"Brief generation failed ({reason}). Check source availability and Azure configuration.")
         content = generate_brief.empty_brief(generate_brief.date_context(now)["brief_date"], [])
+        content.calendar = generate_brief.normalize_calendar(
+            content, now.date(), {}, data.get("attendance", {}).get("records", []),
+        )
         content.warnings = list(dict.fromkeys(content.warnings + warnings))
         generate_brief.write_content(content)
         print(f"Wrote {generate_brief.CONTENT_PATH}")

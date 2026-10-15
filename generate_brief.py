@@ -184,6 +184,12 @@ class Holiday(BaseModel):
     reason: str
 
 
+class AttendanceRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    date: calendar_date
+    status: Literal["present", "absent", "leave"]
+
+
 class CalendarDay(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     date: calendar_date
@@ -193,6 +199,7 @@ class CalendarDay(BaseModel):
     agenda: list[str]
     reminders: list[str]
     holidays: list[Holiday]
+    attendance: Literal["present", "absent", "leave"] | None = None
 
 
 class BriefContent(BaseModel):
@@ -239,7 +246,13 @@ def select_homework_pages(pages: list[HomeworkPage], notebook_pages: dict[str, H
 
 
 def normalize_calendar(content: BriefContent, today: calendar_date,
-                       notebook_pages: dict[str, HomeworkPage]) -> list[CalendarDay]:
+                       notebook_pages: dict[str, HomeworkPage],
+                       attendance: list[dict] | None = None) -> list[CalendarDay]:
+    attendance_records = [AttendanceRecord.model_validate_json(json.dumps(record))
+                          for record in attendance or []]
+    attendance_by_date: dict[calendar_date, Literal["present", "absent", "leave"]] = {
+        record.date: record.status for record in attendance_records
+    }
     days = {
         today.replace(day=number): CalendarDay(
             date=today.replace(day=number), classwork=[], homework=[], homework_pages=[],
@@ -259,6 +272,7 @@ def normalize_calendar(content: BriefContent, today: calendar_date,
     upcoming_holidays = {holiday.date: holiday for holiday in content.holidays
                          if holiday.date >= today and holiday.date.weekday() < 5}
     for day in days.values():
+        day.attendance = attendance_by_date.get(day.date)
         if day.date > today:
             day.classwork = []
             day.homework = []
@@ -302,7 +316,7 @@ def date_context(now: datetime | None = None) -> _DateContext:
         "reminders_through_ist": (today + timedelta(days=14)).isoformat(),
         "calendar_start_ist": today.replace(day=1).isoformat(),
         "calendar_end_ist": today.replace(day=monthrange(today.year, today.month)[1]).isoformat(),
-        "brief_date": f"{tomorrow.strftime('%A, %B')} {tomorrow.day}, {tomorrow.year}",
+        "brief_date": f"{today.strftime('%A, %B')} {today.day}, {today.year}",
     }
 
 
@@ -530,7 +544,10 @@ def generate(data: dict[str, Any], now: datetime | None = None, *,
     if not any(source.get("messages") for source in data.values()):
         payload, warnings, _ = prepare_input(data, now)
         content = empty_brief(payload["brief_date"], warnings)
-        content.calendar = normalize_calendar(content, calendar_date.fromisoformat(payload["today_ist"]), {})
+        content.calendar = normalize_calendar(
+            content, calendar_date.fromisoformat(payload["today_ist"]), {},
+            data.get("attendance", {}).get("records", []),
+        )
         return content
     client, deployment = create_client()
     try:
@@ -550,6 +567,7 @@ def generate(data: dict[str, Any], now: datetime | None = None, *,
             {"role": "user", "content": user_content},
         ]
         schema = BriefContent.model_json_schema()
+        schema["$defs"]["CalendarDay"]["properties"].pop("attendance")
         schema["required"] = list(schema["properties"])
         response_format: ResponseFormatJSONSchema = {
             "type": "json_schema",
@@ -591,7 +609,9 @@ def generate(data: dict[str, Any], now: datetime | None = None, *,
             if sent_at.date() == today:
                 content.homework_pages.append(notebook_pages[document["url"]])
         content.homework_pages = select_homework_pages(content.homework_pages, notebook_pages, content.warnings)
-        content.calendar = normalize_calendar(content, today, notebook_pages)
+        content.calendar = normalize_calendar(
+            content, today, notebook_pages, data.get("attendance", {}).get("records", []),
+        )
         return content
     finally:
         client.close()
@@ -605,8 +625,9 @@ def load_stored_input(now: datetime | None = None) -> dict[str, Any]:
     archives = cleanup_stored_data(now)
     saved_input = json.loads(INPUT_PATH.read_text(encoding="utf-8")) if INPUT_PATH.exists() else {}
     return {
-        name: {"messages": messages, "error": saved_input.get(name, {}).get("error")}
-        for name, messages in archives.items()
+        "attendance": saved_input.get("attendance", {"messages": [], "records": [], "error": None}),
+        **{name: {"messages": messages, "error": saved_input.get(name, {}).get("error")}
+           for name, messages in archives.items()},
     }
 
 

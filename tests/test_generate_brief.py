@@ -91,7 +91,14 @@ def test_dates_use_ist_even_when_utc_is_previous_day():
     assert context["tomorrow_ist"] == "2026-10-08"
     assert context["tomorrow_weekday"] == "Thursday"
     assert context["reminders_through_ist"] == "2026-10-21"
-    assert context["brief_date"] == "Thursday, October 8, 2026"
+    assert context["brief_date"] == "Wednesday, October 7, 2026"
+
+
+def test_brief_date_is_today_without_changing_tomorrow_agenda_date():
+    context = generate_brief.date_context(datetime(2026, 10, 15, 9, tzinfo=generate_brief.IST))
+    assert context["brief_date"] == "Thursday, October 15, 2026"
+    assert context["today_ist"] == "2026-10-15"
+    assert context["tomorrow_ist"] == "2026-10-16"
 
 
 @pytest.mark.parametrize(("today", "through"), [
@@ -426,6 +433,60 @@ def test_schema_rejects_wrong_types_and_extra_keys():
         generate_brief.BriefContent.model_validate(data)
 
 
+def test_attendance_is_added_to_calendar_without_messages_or_azure(monkeypatch):
+    monkeypatch.setattr(generate_brief, "create_client", lambda: pytest.fail("Unexpected Azure call"))
+    content = generate_brief.generate({
+        "attendance": {"messages": [], "records": [
+            {"date": "2026-10-14", "status": "absent"},
+            {"date": "2026-10-15", "status": "present"},
+            {"date": "2026-10-31", "status": "leave"},
+        ], "error": None},
+    }, now=datetime(2026, 10, 15, 12, tzinfo=generate_brief.IST))
+    days = {day.date.isoformat(): day.attendance for day in content.calendar}
+    assert days["2026-10-14"] == "absent"
+    assert days["2026-10-15"] == "present"
+    assert days["2026-10-31"] == "leave"
+    assert days["2026-10-16"] is None
+
+
+def test_attendance_is_not_requested_from_model(monkeypatch):
+    client = Mock()
+    client.chat.completions.create.return_value = SimpleNamespace(choices=[SimpleNamespace(
+        finish_reason="stop", message=SimpleNamespace(
+            refusal=None, content=generate_brief.empty_brief("date", []).model_dump_json(),
+        ),
+    )])
+    monkeypatch.setattr(generate_brief, "create_client", lambda: (client, "deployment"))
+    content = generate_brief.generate({
+        "portal": {"messages": [{"body": "Homework notice"}]},
+        "attendance": {"messages": [], "records": [{"date": "2026-10-15", "status": "absent"}]},
+    }, now=datetime(2026, 10, 15, 12, tzinfo=generate_brief.IST))
+    schema = client.chat.completions.create.call_args.kwargs["response_format"]["json_schema"]["schema"]
+    assert "attendance" not in schema["$defs"]["CalendarDay"]["properties"]
+    assert next(day for day in content.calendar if day.date.isoformat() == "2026-10-15").attendance == "absent"
+
+
+def test_calendar_ignores_model_attendance_without_portal_evidence():
+    from datetime import date
+
+    content = generate_brief.empty_brief("date", [])
+    content.calendar = [generate_brief.CalendarDay(
+        date=date(2026, 10, 15), classwork=[], homework=[], homework_pages=[],
+        agenda=[], reminders=[], holidays=[], attendance="present",
+    )]
+    days = generate_brief.normalize_calendar(content, date(2026, 10, 15), {})
+    assert all(day.attendance is None for day in days)
+
+
+def test_saved_input_preserves_attendance(tmp_path, monkeypatch):
+    attendance = {"messages": [], "records": [{"date": "2026-10-15", "status": "present"}], "error": None}
+    path = tmp_path / "input.json"
+    path.write_text(json.dumps({"attendance": attendance}))
+    monkeypatch.setattr(generate_brief, "INPUT_PATH", path)
+    monkeypatch.setattr(generate_brief, "cleanup_stored_data", lambda now: {"portal": [], "whatsapp": []})
+    assert generate_brief.load_stored_input()["attendance"] == attendance
+
+
 def test_empty_sources_do_not_call_azure(monkeypatch):
     monkeypatch.setattr(generate_brief, "create_client", lambda: pytest.fail("Unexpected Azure call"))
     content = generate_brief.generate({
@@ -731,7 +792,7 @@ def test_azure_generation_validates_response_and_closes_client(monkeypatch, fini
     else:
         result = generate_brief.generate(data, datetime(2026, 10, 7, 12, tzinfo=timezone.utc))
         assert result.homework == ["Read page 12"]
-        assert result.date == "Thursday, October 8, 2026"
+        assert result.date == "Wednesday, October 7, 2026"
     assert calls["closed"]
     assert calls["model"] == "configured-deployment"
     assert calls["response_format"]["json_schema"]["strict"] is True

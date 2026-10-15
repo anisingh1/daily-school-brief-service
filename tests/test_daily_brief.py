@@ -51,11 +51,45 @@ def test_collection_caps_stale_cursor_at_lookback(source, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def isolated_storage(tmp_path, monkeypatch):
+    monkeypatch.setattr(daily_brief, "fetch_attendance", lambda *args: [])
     monkeypatch.setattr(portal_archive, "DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(portal_archive, "ARCHIVE_PATH", tmp_path / "data" / "portal_messages.json")
     monkeypatch.setattr(portal_archive, "WHATSAPP_ARCHIVE_PATH", tmp_path / "data" / "whatsapp_messages.json")
     monkeypatch.setattr(portal_archive, "LAST_RUN_PATH", tmp_path / "data" / "last_run.json")
     monkeypatch.setattr(portal_archive, "OUTPUT_DIR", tmp_path / "output")
+
+
+@pytest.mark.parametrize("initialize,source", [(True, None), (False, None), (False, "portal")])
+def test_attendance_collected_for_initialization_refresh_and_portal(initialize, source, monkeypatch):
+    from datetime import datetime
+
+    today = datetime.now(portal_archive.IST).date().isoformat()
+    records = [{"date": today, "status": "present"}]
+    calls = []
+    monkeypatch.setattr(daily_brief, "fetch_attendance", lambda *args: calls.append(args) or records)
+    monkeypatch.setattr(daily_brief, "fetch_recent_messages", lambda **kwargs: [])
+    monkeypatch.setattr(daily_brief, "fetch_recent_whatsapp_messages", lambda **kwargs: [])
+    result = daily_brief.gather(initialize=initialize, source=source)
+    assert len(calls) == 1
+    assert result["attendance"]["records"] == records
+    assert json.loads((portal_archive.DATA_DIR / "attendance.json").read_text()) == records
+
+
+def test_attendance_failure_preserves_records_and_does_not_block_messages(monkeypatch):
+    from datetime import datetime
+
+    records = [{"date": datetime.now(portal_archive.IST).date().isoformat(), "status": "absent"}]
+    portal_archive.write_json(portal_archive.DATA_DIR / "attendance.json", records)
+
+    def fail(*args):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(daily_brief, "fetch_attendance", fail)
+    monkeypatch.setattr(daily_brief, "fetch_recent_messages", lambda **kwargs: [])
+    result = daily_brief.gather(source="portal")
+    assert result["attendance"]["records"] == records
+    assert result["attendance"]["error"] == "RuntimeError: offline"
+    assert result["portal"]["error"] is None
 
 
 @pytest.mark.parametrize("source", ["portal", "whatsapp"])

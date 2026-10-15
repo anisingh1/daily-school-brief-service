@@ -130,6 +130,16 @@ The portal currently exposes one activity page; unavailable historical messages
 cannot be recovered by this endpoint. PDF transcription uses the configured Azure
 deployment and may take time on the initial scan.
 
+Initialization, scheduled polling, `POST /refresh`, and `POST /scrape-udt` also
+fetch the portal's dedicated attendance endpoint for each month in the retention
+window, including the complete current month. Records are stored in
+`data/attendance.json` and included in `output/daily_brief_input.json`.
+Attendance is fetched independently of message cursors so corrected statuses are
+picked up on later runs. A failed attendance fetch reuses retained records and
+reports a warning without blocking homework collection. Collection responses
+report a separate `attendance_records` count. WhatsApp-only collection does not
+fetch attendance.
+
 At each cron tick, the service fetches new portal and WhatsApp messages using
 their separate cursors, stores text/PDFs, prepares PDF caches,
 applies cleanup, and generates the saved brief. It does not send email.
@@ -204,7 +214,11 @@ PDF cache version `v3` refreshes older extractions to preserve these visual cues
 For a date-selecting frontend, use the response's `calendar` array. It contains
 one ISO-dated entry for every day of the current month in IST, in date order,
 including days with no known content. Each entry has `date`, `classwork`,
-`homework`, `homework_pages`, `agenda`, `reminders`, and `holidays`.
+`homework`, `homework_pages`, `agenda`, `reminders`, `holidays`, and `attendance`.
+Attendance is `"present"`, `"absent"`, `"leave"`, or `null` when no record exists.
+It comes directly from portal records, never from model inference or whether a
+day has homework. Explicitly recorded future leave is preserved. Older saved
+calendar entries without attendance default to `null`.
 Agenda, reminders, and holidays include known planner/notice facts throughout
 the month, not just tomorrow or the next 14 days. Reminders are attached to
 the date an action is required. Notice overrides are resolved per affected date.
@@ -224,7 +238,8 @@ Example calendar entry (the actual array contains every date in the month):
       "homework_pages": [],
       "agenda": ["Half-day dismissal at 12:00"],
       "reminders": ["Route 4 pickup changes to 07:30"],
-      "holidays": []
+      "holidays": [],
+      "attendance": null
     }
   ]
 }

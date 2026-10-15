@@ -4,6 +4,41 @@ from pathlib import Path
 import pytest
 
 
+def test_fetch_attendance_normalizes_status_and_filters_dates(monkeypatch):
+    import scrape_udt
+    from unittest.mock import MagicMock
+
+    session = MagicMock()
+    session.__enter__.return_value = session
+    session.get.return_value.json.return_value = [
+        {"date": "2026-10-14", "title": "Present"},
+        {"date": "2026-10-15", "title": "Absent"},
+        {"date": "2026-10-31", "title": "leave"},
+    ]
+    monkeypatch.setattr(scrape_udt.requests, "Session", lambda: session)
+    monkeypatch.setattr(scrape_udt, "login", lambda session: None)
+    assert scrape_udt.fetch_attendance(datetime(2026, 10, 1), datetime(2026, 10, 15)) == [
+        {"date": "2026-10-14", "status": "present"},
+        {"date": "2026-10-15", "status": "absent"},
+    ]
+    assert session.get.call_args.kwargs["params"] == {"year": 2026, "month": 10}
+
+
+def test_fetch_attendance_fetches_each_month_across_year_boundary(monkeypatch):
+    import scrape_udt
+    from unittest.mock import MagicMock
+
+    session = MagicMock()
+    session.__enter__.return_value = session
+    session.get.return_value.json.return_value = []
+    monkeypatch.setattr(scrape_udt.requests, "Session", lambda: session)
+    monkeypatch.setattr(scrape_udt, "login", lambda session: None)
+    assert scrape_udt.fetch_attendance(datetime(2026, 12, 20), datetime(2027, 1, 5)) == []
+    assert [call.kwargs["params"] for call in session.get.call_args_list] == [
+        {"year": 2026, "month": 12}, {"year": 2027, "month": 1},
+    ]
+
+
 def _msg(offset_hours, msg_id):
     posted = datetime.now() - timedelta(hours=offset_hours)
     return {
