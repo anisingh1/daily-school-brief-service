@@ -47,6 +47,7 @@ class MessageCronTrigger(BaseTrigger):
 def prepare_storage(data: dict[str, Any]) -> dict[str, Any]:
     warnings = [f"{name} fetch failed; retained messages were reused."
                 for name, source in data.items() if source.get("error")]
+    warnings.extend(generate_brief.attachment_warnings(data))
     documents = 0
     has_pdfs = any(
         attachment.get("saved_as")
@@ -191,6 +192,9 @@ def create_app() -> FastAPI:
                 collected["attendance"] = data["attendance"]
             summary = prepare_storage(collected)
             summary.pop("warnings", None)
+            download_warnings = generate_brief.attachment_warnings(collected)
+            if download_warnings:
+                summary["warnings"] = download_warnings
             return summary
         except HTTPException:
             raise

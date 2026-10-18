@@ -425,12 +425,22 @@ def snapshot_pdfs(data: dict[str, Any]) -> PDFSnapshot:
     return snapshot
 
 
+def attachment_warnings(data: dict[str, Any]) -> list[str]:
+    return [
+        f"{source_name}: {attachment.get('name', 'PDF')}: {attachment['download_error']}"
+        for source_name, source in data.items()
+        for message in source.get("messages", [])
+        for attachment in message.get("attachments", [])
+        if attachment.get("download_error")
+    ]
+
+
 def prepare_input(data: dict[str, Any], now: datetime | None = None, *,
                   client: AzureOpenAI | None = None, deployment: str = "",
                   pdf_snapshot: PDFSnapshot | None = None,
                   cache_writes: dict[Path, dict[str, Any]] | None = None) -> tuple[dict[str, Any], list[str], list[ChatCompletionContentPartParam]]:
     payload: dict[str, Any] = {**date_context(now), "sources": data, "documents": []}
-    warnings = []
+    warnings = attachment_warnings(data)
     images: list[ChatCompletionContentPartParam] = []
     seen: set[Path] = set()
     for source_name, source in data.items():

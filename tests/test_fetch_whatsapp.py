@@ -4,6 +4,11 @@ from email.message import EmailMessage
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def email_source(monkeypatch):
+    monkeypatch.setenv("WHATSAPP_SOURCE", "email")
+
+
 def test_parse_email_message_extracts_plain_text_message(tmp_path):
     from fetch_whatsapp import parse_email_message
 

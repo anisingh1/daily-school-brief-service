@@ -11,6 +11,7 @@ import service
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
+    monkeypatch.setenv("WHATSAPP_SOURCE", "email")
     monkeypatch.setattr(service.daily_brief, "fetch_attendance", lambda *args: [])
     monkeypatch.setenv("MESSAGE_POLL_CRON", "0 18 * * *")
     monkeypatch.setenv("MESSAGE_POLL_TIMEZONE", "Asia/Kolkata")
@@ -31,6 +32,20 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(service.generate_brief, "create_client", lambda: pytest.fail("Unexpected Azure call"))
     with TestClient(service.create_app()) as test_client:
         yield test_client
+
+
+def test_whatsapp_collection_reports_unavailable_pdf_warnings(client, monkeypatch):
+    monkeypatch.setattr(service.daily_brief, "run", lambda **kwargs: {
+        "whatsapp": {"messages": [{
+            "text": "Notice", "attachments": [{
+                "name": "notice.pdf", "download_error": "Download failed; will retry.",
+            }],
+        }], "error": None},
+    })
+    response = client.post("/fetch-whatsapp")
+    assert response.status_code == 200
+    assert response.json()["messages"] == {"whatsapp": 1}
+    assert response.json()["warnings"] == ["whatsapp: notice.pdf: Download failed; will retry."]
 
 
 def test_favicon_returns_no_content_without_authentication(monkeypatch):

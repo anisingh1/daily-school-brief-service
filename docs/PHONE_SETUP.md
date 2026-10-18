@@ -1,5 +1,8 @@
 # Phone-Side WhatsApp Capture Setup
 
+These instructions apply to `WHATSAPP_SOURCE=email` (the default).
+For direct ingestion without phone forwarding, see [EVOLUTION_SETUP.md](EVOLUTION_SETUP.md).
+
 This captures messages (and documents) from the school WhatsApp group
 without any unofficial WhatsApp client or automation library - it works
 entirely through Android's own notification and file systems, and

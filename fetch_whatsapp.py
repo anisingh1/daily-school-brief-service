@@ -1,5 +1,8 @@
 """
-Fetches WhatsApp group messages captured via phone automation as email.
+Fetch WhatsApp group messages from email capture or Evolution API.
+
+Set WHATSAPP_SOURCE=evolution for direct ingestion (see docs/EVOLUTION_SETUP.md).
+The default email source retains the phone automation workflow below.
 
 Messages are captured by two MacroDroid rules on an Android phone (see
 docs/PHONE_SETUP.md):
@@ -166,7 +169,28 @@ def _connect_imap() -> imaplib.IMAP4_SSL:
     return conn
 
 
+def whatsapp_source() -> str:
+    source = os.getenv("WHATSAPP_SOURCE", "email").strip().lower()
+    if source not in {"email", "evolution"}:
+        raise ValueError("WHATSAPP_SOURCE must be email or evolution")
+    return source
+
+
 def fetch_recent_whatsapp_messages(
+    lookback_hours: float | None = None, cutoff: datetime | None = None
+) -> list[dict]:
+    if whatsapp_source() == "evolution":
+        from fetch_evolution import fetch_recent_evolution_messages
+
+        if cutoff is None:
+            cutoff = datetime.now().astimezone() - timedelta(
+                hours=LOOKBACK_HOURS if lookback_hours is None else lookback_hours,
+            )
+        return fetch_recent_evolution_messages(cutoff, ATTACHMENTS_DIR)
+    return _fetch_recent_email_messages(lookback_hours=lookback_hours, cutoff=cutoff)
+
+
+def _fetch_recent_email_messages(
     lookback_hours: float | None = None, cutoff: datetime | None = None
 ) -> list[dict]:
     if not WHATSAPP_SUBJECT_PREFIX:

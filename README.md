@@ -1,7 +1,7 @@
 # Daily School Brief
 
-Pulls together messages from the school web portal and (via phone-forwarded
-messages captured as email) the school WhatsApp group, and
+Pulls together messages from the school web portal and the school WhatsApp
+group (directly through Evolution API, or via phone-forwarded email), and
 produces a daily brief covering homework, tomorrow's agenda, tomorrow's
 dress code, and other reminders using direct Azure OpenAI calls. Claude Code
 and agent skills are not required to run the pipeline.
@@ -16,7 +16,8 @@ versions; the current workflow and run instructions are below.
 1. Start the REST service and call `POST /initialize` to populate local storage.
 2. The in-process cron scheduler collects messages on the configured schedule.
   Each source uses its own last successful fetch cursor within the configured
-  lookback window. Both sources are merged into local JSON archives.
+  lookback window, including Evolution. Both sources are merged into local
+  JSON archives.
 3. Missing PDFs are downloaded. New or changed PDFs are transcribed with Azure
   using extracted text and page images. Full-page transcriptions are cached by
   file hash and extraction version, so unchanged PDFs are not uploaded again.
@@ -65,10 +66,16 @@ Do not overwrite an existing `.env`. Fill in these settings:
   Use the deployment name, not the model family name. It must support Chat
   Completions, strict JSON-schema structured outputs, and image input.
 - `SMTP_USERNAME`, `SMTP_APP_PASSWORD`: Gmail credentials, also used for
-  WhatsApp capture over IMAP. Use a Gmail App Password with 2-Step Verification
+  email-based WhatsApp capture over IMAP. Use a Gmail App Password with 2-Step Verification
   enabled, not the account password.
 - `EMAIL_TO`: recipients for optional email delivery, comma-separated.
-- `WHATSAPP_EMAIL_TO`: capture mailbox address. Complete the phone automation
+- `WHATSAPP_SOURCE`: `email` (default) or `evolution`. For direct ingestion
+  without a capture mailbox, set `evolution` and configure `EVOLUTION_API_URL`,
+  `EVOLUTION_API_KEY`, `EVOLUTION_INSTANCE`, and `EVOLUTION_GROUP_JID`.
+  Follow [docs/EVOLUTION_SETUP.md](docs/EVOLUTION_SETUP.md) for native installation,
+  QR pairing, group discovery, and verification. Evolution uses an unofficial
+  WhatsApp Web connection; review the account and privacy risks before linking.
+- `WHATSAPP_EMAIL_TO`: email-source capture mailbox address. Complete the phone automation
   setup in [docs/PHONE_SETUP.md](docs/PHONE_SETUP.md) to enable this source.
 - `WHATSAPP_SUBJECT_PREFIX`: mandatory capture identifier in email subjects,
   default `[WhatsApp School]`. Only subjects equal to this marker or starting
@@ -158,8 +165,8 @@ curl -X POST http://127.0.0.1:8000/scrape-udt
 curl -X POST http://127.0.0.1:8000/fetch-whatsapp
 ```
 
-Each endpoint fetches messages strictly newer than that source's last successful
-collection start time, bounded by the configured lookback window. Without a
+Portal and email capture fetch messages strictly newer than that source's last
+successful collection start time, bounded by the configured lookback window. Without a
 saved cursor, it uses that window directly. Messages and attachments are saved locally and PDF caches are prepared;
 neither endpoint generates a brief or sends email. The response includes retained
 message counts and PDF document counts. The other source is not fetched.
@@ -539,7 +546,19 @@ For just the REST service and scheduler tests:
   and extracting the real file URL from an embedded `file_path` JS
   variable, then downloading that URL directly (skipped if already
   downloaded).
-- WhatsApp text messages are captured entirely through Android's normal
+- With `WHATSAPP_SOURCE=evolution`, the scheduler polls a self-hosted Evolution
+  API v2 instance. It imports only the configured group's text, captions, and
+  PDF documents; images, audio, video, and other document binaries are not imported.
+  Normal collection only queries messages newer than the last successful
+  WhatsApp run, bounded by retention. Stable IDs prevent duplicates. A disconnected instance or malformed
+  response fails that collection explicitly and leaves the prior archive/cursor
+  intact. Unavailable PDFs retain their message and attachment metadata with a
+  visible download warning and are not retried by normal polls. Use explicit
+  initialization to recheck history and retry unavailable PDFs. Late-synced
+  messages dated before the cursor also require initialization. Invalid PDF content
+  and local storage failures still fail collection. No public webhook endpoint
+  is required.
+- With the default `WHATSAPP_SOURCE=email`, WhatsApp text messages are captured through Android's normal
   notification system (via phone automation), not through any unofficial
   WhatsApp client library — see the design spec for why. WhatsApp
   document attachments are captured by watching WhatsApp's own

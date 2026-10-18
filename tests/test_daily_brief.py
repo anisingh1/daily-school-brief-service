@@ -6,9 +6,11 @@ import daily_brief
 import portal_archive
 
 
-def test_initialization_uses_configured_lookback_ignoring_cursors(monkeypatch):
+@pytest.mark.parametrize("whatsapp_source", ["email", "evolution"])
+def test_initialization_uses_configured_lookback_ignoring_cursors(monkeypatch, whatsapp_source):
     from datetime import datetime
 
+    monkeypatch.setenv("WHATSAPP_SOURCE", whatsapp_source)
     calls = {}
     cutoff = datetime(2026, 10, 1, 12)
     monkeypatch.setattr(portal_archive, "retention_cutoff", lambda *args: cutoff)
@@ -51,12 +53,39 @@ def test_collection_caps_stale_cursor_at_lookback(source, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def isolated_storage(tmp_path, monkeypatch):
+    monkeypatch.setenv("WHATSAPP_SOURCE", "email")
     monkeypatch.setattr(daily_brief, "fetch_attendance", lambda *args: [])
     monkeypatch.setattr(portal_archive, "DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(portal_archive, "ARCHIVE_PATH", tmp_path / "data" / "portal_messages.json")
     monkeypatch.setattr(portal_archive, "WHATSAPP_ARCHIVE_PATH", tmp_path / "data" / "whatsapp_messages.json")
     monkeypatch.setattr(portal_archive, "LAST_RUN_PATH", tmp_path / "data" / "last_run.json")
     monkeypatch.setattr(portal_archive, "OUTPUT_DIR", tmp_path / "output")
+
+
+def test_evolution_uses_successful_cursor_and_retains_prior_messages(monkeypatch):
+    from datetime import datetime, timedelta
+
+    monkeypatch.setenv("WHATSAPP_SOURCE", "evolution")
+    now = datetime.now(portal_archive.IST).replace(tzinfo=None)
+    previous = now - timedelta(hours=1)
+    portal_archive.save_whatsapp_last_run(previous)
+    message = {
+        "id": "evolution:stable", "timestamp": (now - timedelta(minutes=30)).isoformat(),
+        "sender": "Teacher", "text": "New notice", "attachments": [],
+    }
+    calls = []
+
+    def fetch(**kwargs):
+        calls.append(kwargs["cutoff"])
+        return [message] if len(calls) == 1 else []
+
+    monkeypatch.setattr(daily_brief, "fetch_recent_whatsapp_messages", fetch)
+    for _ in range(2):
+        previous = portal_archive.read_whatsapp_last_run()
+        result = daily_brief.gather(source="whatsapp")
+        assert result["whatsapp"] == {"messages": [message], "error": None}
+        assert calls[-1] == (previous + timedelta(microseconds=1)).replace(tzinfo=portal_archive.IST)
+    assert portal_archive.load_archive(portal_archive.WHATSAPP_ARCHIVE_PATH) == [message]
 
 
 @pytest.mark.parametrize("initialize,source", [(True, None), (False, None), (False, "portal")])
@@ -124,9 +153,11 @@ def test_source_collection_uses_own_cursor_only(source, monkeypatch):
         assert portal_archive.read_last_run() == previous
 
 
-def test_whatsapp_failure_preserves_cursor(monkeypatch):
+@pytest.mark.parametrize("whatsapp_source", ["email", "evolution"])
+def test_whatsapp_failure_preserves_cursor(monkeypatch, whatsapp_source):
     from datetime import datetime
 
+    monkeypatch.setenv("WHATSAPP_SOURCE", whatsapp_source)
     previous = datetime(2026, 10, 8, 10)
     portal_archive.save_whatsapp_last_run(previous)
 
@@ -390,5 +421,3 @@ def test_pipeline_replaces_stale_content_with_warning_and_still_delivers(monkeyp
     assert "RuntimeError" in result["warnings"][-1]
     assert "sensitive detail" not in content_path.read_text()
     assert sent == [False]
-
-
