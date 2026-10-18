@@ -2,9 +2,9 @@
 
 This source replaces phone-to-email forwarding. The brief service polls a
 self-hosted Evolution API v2 instance for school-group messages and imports
-text, captions, and PDF documents directly into the existing archive. It does
-not send an email for each WhatsApp message. Brief email delivery remains the
-separate existing `/email-brief` operation.
+text, captions, and PDF documents directly into the existing archive.
+Evolution is the only supported WhatsApp source; email capture and brief
+email delivery have been removed.
 
 ## Account and privacy limitations
 
@@ -165,6 +165,26 @@ first. This setup does not install an automatic boot/login service. Stop it
 with Ctrl-C when running in the foreground, or terminate only its known PID.
 Do not kill shared PostgreSQL/Redis services or flush Redis.
 
+### Start both applications from VS Code
+
+In **Run and Debug**, select **Debug: service + Evolution** from the launch
+dropdown and press F5. The compound configuration starts the Python service
+and launches Node directly with the built `../evolution-api/dist/main.js`
+entrypoint, equivalent to `npm run start:prod`. Evolution runs in the Debug
+Console, with its working directory set to the sibling checkout, and reads its
+own `.env` through its existing dotenv loader. This avoids shell activation
+races and expanding private configuration into an integrated-terminal command.
+Stopping either debug session stops
+both. The existing Python-only launch and a separate **Debug: Evolution API**
+launch are also available.
+
+PostgreSQL and Redis must already be running, Node must be on VS Code's
+PATH, and Evolution must already be built. The compound starts both processes
+in parallel; it does not wait for Evolution readiness. Wait for its listener
+before calling collection endpoints. Stop any separately running instance on
+port 8080 before using the compound; if Evolution is already running and should
+stay independent, select **Debug: service.py** instead.
+
 ## Pair WhatsApp and select the school group
 
 Back in the **daily-school-brief** repository, configure its existing `.env`
@@ -210,11 +230,12 @@ The helper validates the ID against this instance's groups, then sets
 `.env`. It also deletes the local QR image. Restart the brief service to load
 the changed configuration. Email capture remains the default until selection;
 there is no automatic fallback to a different source on Evolution failure.
-To revert intentionally, set `WHATSAPP_SOURCE=email` and restart.
+No source selector is required. Remove a legacy `WHATSAPP_SOURCE=email` value
+before restarting; if the variable is retained, it must be `evolution`.
 
 ## Verify collection
 
-For ingestion only, without calling Azure, sending email, or fetching the
+For ingestion only, without calling Azure or fetching the
 school portal, stop the brief service and run:
 
 ```bash
@@ -267,7 +288,7 @@ No inbound webhook, public tunnel, or capture mailbox is needed.
   reference. This covers expired historical media
   (WhatsApp HTTP 410, often surfaced by Evolution as HTTP 400) and transient
   network failures. No PDF contents are invented or silently dropped.
-- Switching from phone email capture does not remove retained email records.
+- Removing phone email capture does not remove retained email records.
   They do not share Evolution IDs, so overlapping old captures can remain
   duplicated until they expire. Disable phone capture after validating Evolution.
 - Application retention only cleans the brief application's files, not

@@ -641,17 +641,98 @@ def load_stored_input(now: datetime | None = None) -> dict[str, Any]:
     }
 
 
-def run(data: dict[str, Any] | None = None, now: datetime | None = None) -> BriefContent:
+class BriefCacheMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    input_hash: str
+    content_hash: str
+
+
+def json_hash(value: Any) -> str:
+    return hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def brief_input_hash(data: dict[str, Any], now: datetime, snapshot: PDFSnapshot) -> tuple[str, bool]:
+    pdfs = {}
+    complete = True
+    for path, (contents, cached_text) in snapshot.items():
+        extracted = None
+        if cached_text is not None:
+            try:
+                extracted = validate_pdf_text(cached_text).model_dump()
+            except ValueError:
+                LOGGER.warning("Invalid PDF cache for %s; extraction will be retried", path.name)
+        if isinstance(contents, OSError) or extracted is None:
+            complete = False
+        pdfs[str(path)] = {
+            "bytes": type(contents).__name__ if isinstance(contents, OSError) else hashlib.sha256(contents).hexdigest(),
+            "extraction": extracted,
+        }
+    return json_hash({
+        "sources": data, "date_context": date_context(now), "pdfs": pdfs,
+        "prompt": SYSTEM_PROMPT, "schema": BriefContent.model_json_schema(),
+        "implementation": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "pdf_cache_version": PDF_CACHE_VERSION,
+        "settings": {key: os.getenv(key, "").strip() for key in (
+            "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT", "AZURE_OPENAI_API_VERSION",
+            "SERVICE_PUBLIC_URL",
+        )},
+    }), complete
+
+
+def run_with_status(data: dict[str, Any] | None = None, now: datetime | None = None) -> tuple[BriefContent, bool]:
+    """Return the saved brief and whether unchanged cached content was reused."""
     if now is None:
         now = datetime.now(IST)
+    load_dotenv(ROOT / ".env")
     if data is None:
         LOGGER.info("Loading stored brief input")
         data = load_stored_input(now)
         LOGGER.info("Stored brief input loaded")
-    content = generate(data, now=now)
+    snapshot = snapshot_pdfs(data)
+    input_hash, complete = brief_input_hash(data, now, snapshot)
+    metadata_path = CONTENT_PATH.with_suffix(".cache.json")
+    try:
+        metadata = BriefCacheMetadata.model_validate_json(metadata_path.read_text(encoding="utf-8"))
+        if complete and metadata.input_hash == input_hash:
+            content = validate_brief_content(CONTENT_PATH.read_text(encoding="utf-8"))
+            if metadata.content_hash == json_hash(content.model_dump(mode="json")):
+                LOGGER.info("Brief cache hit; skipping Azure generation")
+                return content, True
+            LOGGER.warning("Saved brief does not match its cache metadata; regenerating")
+    except FileNotFoundError:
+        LOGGER.debug("No matching saved brief cache")
+    except (OSError, ValueError, UnicodeError) as error:
+        LOGGER.warning("Saved brief cache unavailable (%s); regenerating", type(error).__name__)
+
+    cache_writes: dict[Path, dict[str, Any]] = {}
+    content = generate(data, now=now, pdf_snapshot=snapshot, cache_writes=cache_writes)
+    for path, extracted in cache_writes.items():
+        write_json(path, extracted)
+    updated_snapshot = {}
+    for path, (contents, cached_text) in snapshot.items():
+        if not isinstance(contents, OSError):
+            cache_path = PDF_DIR.parent / "pdf_cache" / f"{hashlib.sha256(contents).hexdigest()}_{PDF_CACHE_VERSION}.json"
+            if cache_path in cache_writes:
+                cached_text = json.dumps(cache_writes[cache_path])
+        updated_snapshot[path] = contents, cached_text
+    input_hash, complete = brief_input_hash(data, now, updated_snapshot)
     LOGGER.info("Saving validated brief content")
     write_content(content)
+    if complete:
+        write_json(metadata_path, BriefCacheMetadata(
+            input_hash=input_hash, content_hash=json_hash(content.model_dump(mode="json")),
+        ).model_dump())
+    else:
+        LOGGER.warning("Brief cache reuse disabled because PDF preparation is incomplete; next refresh will retry")
+        metadata_path.unlink(missing_ok=True)
     print(f"Wrote {CONTENT_PATH}")
+    return content, False
+
+
+def run(data: dict[str, Any] | None = None, now: datetime | None = None) -> BriefContent:
+    content, _ = run_with_status(data=data, now=now)
     return content
 
 

@@ -1,7 +1,7 @@
 # Daily School Brief
 
 Pulls together messages from the school web portal and the school WhatsApp
-group (directly through Evolution API, or via phone-forwarded email), and
+group directly through Evolution API, and
 produces a daily brief covering homework, tomorrow's agenda, tomorrow's
 dress code, and other reminders using direct Azure OpenAI calls. Claude Code
 and agent skills are not required to run the pipeline.
@@ -23,21 +23,21 @@ versions; the current workflow and run instructions are below.
   file hash and extraction version, so unchanged PDFs are not uploaded again.
 4. Collection and brief generation apply retention cleanup, defaulting to 35
   days. Retained message timestamps determine which messages and PDFs stay.
-5. After collection and PDF preparation, the same cron job generates the brief.
-  Azure applies the school rules; Python validates and saves the JSON output.
+5. After collection and PDF preparation, the same cron job generates the brief
+  only when its inputs or date context have changed. Otherwise it reuses the
+  last validated brief without an Azure generation request.
   Call `GET /brief` (or `POST /brief`) to read it without any Azure calls.
   Use `POST /refresh` to run the complete cron workflow immediately.
-6. Call `POST /email-brief` to email the saved brief to the configured recipients.
-  For a local HTML preview without delivery, run `send_email.py --preview`
-  only while the service is stopped.
+6. Consume the saved JSON through `/brief`; email rendering, SMTP delivery,
+  and email-based WhatsApp capture are no longer supported.
 
 Storage is local files, not a database. No Claude runtime, agent framework,
 OS cron job, or automatic Git commit is needed. Keep `data/` persistent and run
 one service process against it.
 
 The REST workflow combines scheduled collection and generation, with separate
-saved-content reads and email delivery. Running
-`daily_brief.py` directly still performs all three steps in one command using
+saved-content reads. Running
+`daily_brief.py` directly performs collection and change-aware generation using
 the same shared implementations. It is an alternative to the service, not a
 second process to run alongside it against the same files.
 
@@ -65,23 +65,17 @@ Do not overwrite an existing `.env`. Fill in these settings:
   `AZURE_OPENAI_API_VERSION`, `AZURE_OPENAI_API_KEY`: your Azure deployment.
   Use the deployment name, not the model family name. It must support Chat
   Completions, strict JSON-schema structured outputs, and image input.
-- `SMTP_USERNAME`, `SMTP_APP_PASSWORD`: Gmail credentials, also used for
-  email-based WhatsApp capture over IMAP. Use a Gmail App Password with 2-Step Verification
-  enabled, not the account password.
-- `EMAIL_TO`: recipients for optional email delivery, comma-separated.
-- `WHATSAPP_SOURCE`: `email` (default) or `evolution`. For direct ingestion
-  without a capture mailbox, set `evolution` and configure `EVOLUTION_API_URL`,
+- Configure `EVOLUTION_API_URL`,
   `EVOLUTION_API_KEY`, `EVOLUTION_INSTANCE`, and `EVOLUTION_GROUP_JID`.
   Follow [docs/EVOLUTION_SETUP.md](docs/EVOLUTION_SETUP.md) for native installation,
   QR pairing, group discovery, and verification. Evolution uses an unofficial
   WhatsApp Web connection; review the account and privacy risks before linking.
-- `WHATSAPP_EMAIL_TO`: email-source capture mailbox address. Complete the phone automation
-  setup in [docs/PHONE_SETUP.md](docs/PHONE_SETUP.md) to enable this source.
-- `WHATSAPP_SUBJECT_PREFIX`: mandatory capture identifier in email subjects,
-  default `[WhatsApp School]`. Only subjects equal to this marker or starting
-  with the marker followed by a space are imported. Other mail to the capture
-  address is ignored; an empty marker is rejected. This is a routing identifier,
-  not sender authentication. Existing unmarked forwarded mail is not imported.
+
+Old SMTP, recipient, IMAP, and phone-capture settings are unused and can be
+removed from an existing `.env`. `WHATSAPP_SOURCE` is unnecessary; if retained,
+it must be `evolution`. Old `email` values fail explicitly rather than silently
+switching sources. Previously imported messages remain until normal retention
+removes them.
 
 The schedule and retention settings are shown below. Retention must be a
 positive integer. Keep `.env` private and never commit it. School messages and
@@ -131,8 +125,8 @@ window before saving attachments, downloads missing
 PDFs while reusing existing files in `data/pdfs/`, and creates the message JSON
 archives and cached PDF transcriptions. It also collects captured WhatsApp
 messages within the same lookback window. Older messages/PDFs are removed by
-retention cleanup, even during initialization. It does not generate a brief
-or send email. The response reports retained message/document counts and warnings.
+retention cleanup, even during initialization. It does not generate a brief.
+The response reports retained message/document counts and warnings.
 The portal currently exposes one activity page; unavailable historical messages
 cannot be recovered by this endpoint. PDF transcription uses the configured Azure
 deployment and may take time on the initial scan.
@@ -149,7 +143,7 @@ fetch attendance.
 
 At each cron tick, the service fetches new portal and WhatsApp messages using
 their separate cursors, stores text/PDFs, prepares PDF caches,
-applies cleanup, and generates the saved brief. It does not send email.
+applies cleanup, and generates or reuses the saved brief.
 Refresh errors are visible in `GET /health`; failed generation does not replace
 the last successfully saved brief.
 Starting the service does not immediately fetch or initialize storage.
@@ -165,10 +159,11 @@ curl -X POST http://127.0.0.1:8000/scrape-udt
 curl -X POST http://127.0.0.1:8000/fetch-whatsapp
 ```
 
-Portal and email capture fetch messages strictly newer than that source's last
+Portal and Evolution fetch messages strictly newer than that source's last
 successful collection start time, bounded by the configured lookback window. Without a
 saved cursor, it uses that window directly. Messages and attachments are saved locally and PDF caches are prepared;
-neither endpoint generates a brief or sends email. The response includes retained
+neither endpoint generates the final brief. New/changed PDFs may still require
+Azure transcription. The response includes retained
 message counts and PDF document counts. The other source is not fetched.
 Cursors advance only after successful fetching and archive persistence, so failed
 fetches or archive writes can be retried. `POST /initialize` bypasses both cursors
@@ -181,14 +176,16 @@ curl -X POST http://127.0.0.1:8000/refresh
 ```
 
 This synchronous endpoint fetches both sources, stores messages/PDFs, prepares
-caches, and calls Azure to generate `output/daily_brief_content.json`. It returns
-collection counts, warnings, `brief_generated`, and `duration_seconds`. It never
-sends email. Without initialized storage, collection uses the configured
+caches, and generates or reuses `output/daily_brief_content.json`. It returns
+collection counts, warnings, `brief_generated`, `brief_reused`, and
+`duration_seconds`. A cache hit returns `brief_generated: false` and
+`brief_reused: true`; read the unchanged content through `/brief`.
+Without initialized storage, collection uses the configured
 lookback window. Failures return HTTP 502; overlapping storage operations return
 HTTP 409. This endpoint can take as long as the scheduled workflow.
 
 Warnings are exposed only in `/initialize` and `/refresh` responses, not in
-`/brief`, `/health`, or rendered emails. Refresh warnings include both collection
+`/brief` or `/health`. Refresh warnings include both collection
 and brief-generation warnings. Scheduled runs log each warning at WARNING level;
 saved content retains warnings for internal diagnostics.
 
@@ -255,7 +252,7 @@ Example calendar entry (the actual array contains every date in the month):
 The top-level fields retain their daily-summary behavior, including tomorrow's
 agenda and the 14-day reminder window (tomorrow through today plus 14 days,
 inclusive); the calendar is the monthly frontend
-view. It is saved with the brief JSON but is not expanded into the daily email.
+view. It is saved with the brief JSON.
 Older saved briefs without `calendar` remain readable. The frontend should cache
 older months itself: this response covers the current month using retained
 sources only. PDF links are subject to server retention, so retaining a link
@@ -279,7 +276,7 @@ superseded, and expired actions are omitted. Dated calendar reminders use the
 action deadline; undated requests are not assigned an invented calendar date.
 
 The response includes a separate `holidays` list, also saved in the brief JSON
-and rendered in the email. It contains confirmed full-day closures from today
+and contains confirmed full-day closures from today
 onward, including known planner dates beyond the reminder window. Dates are
 validated, deduplicated, and sorted; past or cancelled holidays are excluded.
 The list is rebuilt from retained sources on each generation, not maintained in
@@ -315,23 +312,8 @@ Links always use downloaded PDFs via `GET /pdfs/{filename}` on this service.
 PDF downloads require no authentication; anyone who can reach the service and
 knows the URL can access them. Other API routes retain their authentication. Relative links are
 resolved against your service URL. Set `SERVICE_PUBLIC_URL` to your trusted,
-reachable HTTP(S) service URL to produce absolute fallback links for emails.
+reachable HTTP(S) service URL to produce absolute links for API consumers.
 Files must remain under `data/pdfs`; links stop working after retention cleanup.
-Homework-page links are also rendered in the email's Homework section.
-
-Email the saved brief to the recipients configured in `EMAIL_TO`:
-
-```bash
-curl -X POST http://127.0.0.1:8000/email-brief
-```
-
-This validates and renders the saved content, writes the HTML preview, and sends
-it through the existing SMTP configuration. It does not fetch messages or call
-Azure. Success returns `{"status": "sent"}`; missing content returns HTTP 409
-with a prompt to call `POST /refresh`, and validation or delivery failures return
-HTTP 502. Each successful call sends an email; there are no automatic retries.
-If SMTP fails after accepting the message, delivery may be uncertain, so check
-the mailbox before retrying. Saved content and any rendered preview remain available.
 
 `GET /health` reports the schedule, next poll, retention, initialization state,
 and the last scheduled or manual refresh result, including generation status.
@@ -355,17 +337,53 @@ remain supported in code for remote access: a non-local binding requires a
 bearer token, and remote exposure should use HTTPS through a reverse proxy.
 The service does not commit or push archives automatically.
 
-To preview or email the saved brief after a successful refresh:
+### Persistent brief reuse
 
-```bash
-.venv/bin/python send_email.py --preview
-# Optional delivery using SMTP:
-.venv/bin/python send_email.py
-```
+`output/daily_brief_content.cache.json` records the input fingerprint and a
+checksum of the validated saved brief. Reuse survives process restarts and does
+not depend on in-memory state. The shared CLI/service generator checks:
 
-The preview is written to `output/daily_brief_preview.html`. These commands
-reuse saved content without another Azure generation request. Stop the service
-before running standalone commands against the same output files.
+- Retained messages, source errors, attachment metadata, and attendance records.
+- PDF bytes and validated cached transcriptions, including extraction version.
+- IST date context: midnight and the 08:30 dress-code cutoff invalidate reuse.
+- Generation implementation, prompt/schema, Azure endpoint/deployment/API version,
+  and `SERVICE_PUBLIC_URL`. API keys are not stored in cache metadata.
+
+Collection cursors, poll timestamps, and file modification times are not inputs.
+An unchanged refresh still polls for new messages and attendance, but skips
+Azure generation; existing PDF transcriptions also avoid extraction requests.
+Missing/corrupt content or metadata is regenerated, never returned as a cache
+hit. Incomplete PDF preparation prevents brief reuse so later refreshes can retry.
+Failed generation leaves the last successful brief and its metadata untouched.
+The first run after upgrading has no trusted fingerprint and generates once.
+Delete only the cache metadata to force generation on the next refresh.
+
+### Automatic startup and restart on macOS
+
+The application does not install an OS service. For unattended operation, use
+two per-user `launchd` LaunchAgents: one for the Python service and one for the
+native Evolution process. This is a recommended approach, not installed by
+this repository:
+
+- Put job property lists in `~/Library/LaunchAgents`, with unique labels,
+  `RunAtLoad`, `KeepAlive`, and restart throttling such as `ThrottleInterval=30`.
+- Use absolute executable paths: the project's `.venv/bin/python` with
+  `service.py`, and the installed Node executable with Evolution's `dist/main`.
+  Set each `WorkingDirectory` to its repository, because both use local config.
+  Do not rely on interactive shell activation, npm shims, or shell profiles.
+- Explicitly set `SERVICE_RELOAD=false` and use a single Python process/worker.
+  Configure private stdout/stderr log paths and log rotation.
+- Keep the existing shared PostgreSQL and Redis available under their own
+  supervision. launchd does not guarantee dependency startup ordering; Evolution
+  must retry/restart if those dependencies are not yet ready.
+- Stop existing debugger/terminal processes before loading the jobs to avoid
+  duplicate schedulers or occupied ports. Verify `/health`, Evolution readiness,
+  and `evolution_admin.py status`; then test a controlled process restart.
+
+LaunchAgents start at user login, not before login, and do not keep a sleeping
+Mac collecting messages. A continuously awake host is needed for reliable
+scheduled polling. No startup jobs or running processes were changed as part
+of this explanation.
 
 ## Components
 
@@ -377,13 +395,10 @@ before running standalone commands against the same output files.
   message ID + name), so the same document isn't re-downloaded every
   run. Can be run directly (`python scrape_udt.py`), or imported
   (`fetch_recent_messages()`) for use by other scripts.
-- **`fetch_whatsapp.py`** — reads WhatsApp group messages and documents
-  forwarded via phone automation as email (see `docs/PHONE_SETUP.md`),
-  via IMAP using the same Gmail App Password as `send_email.py` (no
-  Google Cloud project or service account), filtered to the same
-  rolling lookback window (standalone) or its saved cursor in the service,
-  bounded by `ARCHIVE_RETENTION_DAYS` (35 days by default). PDF attachments are saved to `data/pdfs/`
-  (prefixed `whatsapp_`); other attachment types are ignored.
+- **`fetch_whatsapp.py`** — Evolution-only entrypoint; delegates text, caption,
+  and PDF ingestion to `fetch_evolution.py`. Uses a rolling lookback standalone,
+  or the saved cursor in the service bounded by `ARCHIVE_RETENTION_DAYS`.
+  See [docs/EVOLUTION_SETUP.md](docs/EVOLUTION_SETUP.md) for setup.
 - **`portal_archive.py`** - persists portal and WhatsApp message archives
   as local JSON, plus each source's last successful fetch cursor. New
   messages are fetched since their cursor, bounded by the retention window.
@@ -395,12 +410,12 @@ before running standalone commands against the same output files.
   treating each as best-effort (one source failing doesn't block the
   other), downloads portal attachments, and writes a combined JSON
   envelope to `output/daily_brief_input.json`. It then calls Azure generation,
-  writes validated content, and renders/sends the email (or writes a preview).
+  writes validated content or reuses the unchanged saved brief.
   The `gather()` and `run()` Python functions still support collection alone.
 - **`service.py`** - long-running cron collection and brief generation, plus REST
   endpoints for initialization, independent source collection, manual refresh,
-  saved brief reads, email delivery, and service health. Scheduling and endpoints reuse the same
-  collection, generation, rendering, and SMTP implementations as the CLI.
+  saved brief reads, and service health. Scheduling and endpoints reuse the same
+  collection and generation implementations as the CLI.
 - **`generate_brief.py`** - reads stored messages and PDFs. New or changed
   PDFs are transcribed by Azure using extracted text and rendered page images,
   preserving dates, scans, and student-to-assignment table rows. Validated
@@ -408,15 +423,6 @@ before running standalone commands against the same output files.
   Unchanged PDFs reuse that text without another PDF/image request. A separate
   daily Azure call applies the school rules and validates the structured brief
   using Pydantic. Dates are computed in IST by Python.
-- **`render_email.py`** — pure function, `render_brief_html(data)`,
-  turning Azure's validated categorization (`output/daily_brief_content.json`)
-  into a polished, sectioned HTML email body. Deterministic and tested,
-  so visual quality is consistent every day regardless of that day's
-  content.
-- **`send_email.py`** — reads `output/daily_brief_content.json`, renders
-  it via `render_email.py`, and sends it as an HTML email via Gmail SMTP.
-  `python send_email.py --preview` skips SMTP and writes
-  `output/daily_brief_preview.html` instead, for local dry runs.
 - `.claude/skills/daily-school-brief/SKILL.md` is only a compatibility launcher
   for older agent-based triggers. It does not interpret messages or generate
   content. New schedules should invoke `python daily_brief.py` directly.
@@ -436,23 +442,18 @@ pipeline use their explicit cursor and `ARCHIVE_RETENTION_DAYS` cutoffs instead.
   ```
   .venv/bin/python fetch_whatsapp.py
   ```
-- Full pipeline (collects messages, generates the brief with Azure, and sends
-  the HTML email):
+- Full pipeline (collects messages, generates or reuses the saved JSON brief):
   ```
   .venv/bin/python daily_brief.py
   ```
-- Full pipeline without sending email:
+- Generate or reuse a brief from the latest stored archives/PDFs without fetching:
   ```
-  .venv/bin/python daily_brief.py --preview
-  ```
-- Regenerate from the latest stored archives/PDFs without fetching or sending email:
-  ```
-  .venv/bin/python daily_brief.py --from-input --preview
+  .venv/bin/python daily_brief.py --from-input
   ```
   Despite the legacy flag name, messages come from the retained archives, not
   the message snapshot in `output/daily_brief_input.json`. The saved input is
   consulted only for source-error metadata.
-- Collection only (no Azure call or email):
+- Collection only (no Azure call):
   ```
   .venv/bin/python daily_brief.py --gather-only
   ```
@@ -465,32 +466,23 @@ pipeline use their explicit cursor and `ARCHIVE_RETENTION_DAYS` cutoffs instead.
   data is ignored by Git. Historical design documents describe the retired
   fresh-clone workflow, not the current runtime.
 
-- Cleanup only, without downloading, calling Azure, or sending email:
+- Cleanup only, without downloading or calling Azure:
   ```
   .venv/bin/python portal_archive.py
   ```
   Cleanup also runs before and after normal collection and before `--from-input`.
   Generation reads the cleaned, retained archives.
 
-If collection raises an unrecoverable error or Azure generation fails, the pipeline replaces
-old content with a warning-only brief and still attempts email/preview delivery.
-It exits nonzero after delivery so the scheduler can detect the failure. Source
+If collection raises an unrecoverable error or Azure generation fails, the pipeline
+preserves the previous saved brief and exits nonzero. Source
 failures and unreadable PDFs appear as warnings; another source can still be
-used. Invalid JSON, refusals, and truncated completions are never sent as a
-normal brief. Empty sources skip the Azure call entirely. Oversized requests
-produce a failure warning rather than silently discarding messages or pages.
-
-The sender saves `output/daily_brief_preview.html` before attempting delivery.
-If an SMTP connection fails before login, check SMTP access on your network,
-VPN, or firewall. After connectivity is restored, run `python send_email.py`
-to send the existing brief without another Azure call. Authentication and
-send-time errors are reported separately; delivery is not retried automatically
-because a disconnect after submission could otherwise produce duplicate emails.
+used. Invalid JSON, refusals, and truncated completions are never saved as a
+normal brief. Empty sources skip Azure entirely. Oversized requests
+fail explicitly rather than silently discarding messages or pages.
 
 ## Verify
 
-Run the automated tests without fetching live messages, calling Azure, or
-sending email:
+Run the automated tests without fetching live messages or calling Azure:
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -514,12 +506,12 @@ For just the REST service and scheduler tests:
   not the authoritative message store for generation. Not committed.
 - `output/daily_brief_content.json` — Azure's validated structured categorization
   (`date`, `warnings`, `classwork`, `homework`, `homework_pages`, `agenda`,
-  `dress_code`, `reminders`), consumed by `send_email.py` to render and
-  send the HTML email. Not committed.
-- `output/daily_brief_preview.html` - rendered HTML from a `--preview` run.
+  `dress_code`, `reminders`, `holidays`, `calendar`), served by `/brief`. Not committed.
+- `output/daily_brief_content.cache.json` - persistent generation fingerprint
+  and saved-content checksum; no messages or credentials are stored here.
 - Aviraj-specific notices and assignments appear in `reminders`, not in a
   separate highlight section. Legacy saved highlights are moved into reminders
-  when read or rendered, without duplicating identical reminder text.
+  when read, without duplicating identical reminder text.
 - `data/portal_messages.json` - the rolling 35-day portal message archive,
   deduplicated by message id. Stored locally, ignored by Git.
 - `data/whatsapp_messages.json` - the rolling 35-day captured WhatsApp message
@@ -546,7 +538,7 @@ For just the REST service and scheduler tests:
   and extracting the real file URL from an embedded `file_path` JS
   variable, then downloading that URL directly (skipped if already
   downloaded).
-- With `WHATSAPP_SOURCE=evolution`, the scheduler polls a self-hosted Evolution
+- The scheduler polls a self-hosted Evolution
   API v2 instance. It imports only the configured group's text, captions, and
   PDF documents; images, audio, video, and other document binaries are not imported.
   Normal collection only queries messages newer than the last successful
@@ -558,16 +550,6 @@ For just the REST service and scheduler tests:
   messages dated before the cursor also require initialization. Invalid PDF content
   and local storage failures still fail collection. No public webhook endpoint
   is required.
-- With the default `WHATSAPP_SOURCE=email`, WhatsApp text messages are captured through Android's normal
-  notification system (via phone automation), not through any unofficial
-  WhatsApp client library — see the design spec for why. WhatsApp
-  document attachments are captured by watching WhatsApp's own
-  auto-save folder for new files - this folder isn't scoped to a
-  single chat, so a document from *any* WhatsApp chat on the phone gets
-  emailed and considered (non-PDF attachments are filtered out; see
-  `docs/PHONE_SETUP.md` for the tradeoff). Both are emailed to a Gmail
-  "+" alias and read via IMAP using the same App Password as
-  `send_email.py` - no Google Cloud project or service account.
 - Retention defaults to 35 days and is controlled by `ARCHIVE_RETENTION_DAYS`.
   Portal and WhatsApp messages older than that window are removed from their
   JSON archives and saved input. Age uses the source message timestamp in IST,
@@ -576,7 +558,7 @@ For just the REST service and scheduler tests:
   A PDF shared with a retained message is kept. Unreferenced files under
   `data/` and old files under `output/` are removed after the retention window by modification
   time. Archives and the operational fetch cursor are retained as metadata.
-  External portal/IMAP history is not deleted. Stored data remains available
+  External portal/Evolution history is not deleted. Stored data remains available
   when a source fetch fails, with an explicit warning in the brief.
   Deleting a file doesn't reclaim git history size on its own though —
   the blob still exists in past commits until a history rewrite

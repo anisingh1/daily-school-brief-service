@@ -6,11 +6,9 @@ import daily_brief
 import portal_archive
 
 
-@pytest.mark.parametrize("whatsapp_source", ["email", "evolution"])
-def test_initialization_uses_configured_lookback_ignoring_cursors(monkeypatch, whatsapp_source):
+def test_initialization_uses_configured_lookback_ignoring_cursors(monkeypatch):
     from datetime import datetime
 
-    monkeypatch.setenv("WHATSAPP_SOURCE", whatsapp_source)
     calls = {}
     cutoff = datetime(2026, 10, 1, 12)
     monkeypatch.setattr(portal_archive, "retention_cutoff", lambda *args: cutoff)
@@ -53,7 +51,6 @@ def test_collection_caps_stale_cursor_at_lookback(source, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def isolated_storage(tmp_path, monkeypatch):
-    monkeypatch.setenv("WHATSAPP_SOURCE", "email")
     monkeypatch.setattr(daily_brief, "fetch_attendance", lambda *args: [])
     monkeypatch.setattr(portal_archive, "DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(portal_archive, "ARCHIVE_PATH", tmp_path / "data" / "portal_messages.json")
@@ -153,11 +150,9 @@ def test_source_collection_uses_own_cursor_only(source, monkeypatch):
         assert portal_archive.read_last_run() == previous
 
 
-@pytest.mark.parametrize("whatsapp_source", ["email", "evolution"])
-def test_whatsapp_failure_preserves_cursor(monkeypatch, whatsapp_source):
+def test_whatsapp_failure_preserves_cursor(monkeypatch):
     from datetime import datetime
 
-    monkeypatch.setenv("WHATSAPP_SOURCE", whatsapp_source)
     previous = datetime(2026, 10, 8, 10)
     portal_archive.save_whatsapp_last_run(previous)
 
@@ -379,7 +374,7 @@ def test_run_writes_output_file(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("from_input", [False, True])
-def test_pipeline_generates_writes_and_previews(monkeypatch, tmp_path, from_input):
+def test_pipeline_generates_and_writes(monkeypatch, tmp_path, from_input):
     data = {"portal": {"messages": [{"body": "homework"}], "error": None}}
     input_path = tmp_path / "input.json"
     input_path.write_text(json.dumps(data))
@@ -390,34 +385,29 @@ def test_pipeline_generates_writes_and_previews(monkeypatch, tmp_path, from_inpu
     def collect():
         calls.append("collect")
         return data
-    def generate(source_data, now):
+    def generate(source_data, now, **kwargs):
         assert source_data == data
         assert now.tzinfo == daily_brief.generate_brief.IST
         calls.append("generate")
         return daily_brief.generate_brief.empty_brief("date", [])
     monkeypatch.setattr(daily_brief, "run", collect)
     monkeypatch.setattr(daily_brief.generate_brief, "generate", generate)
-    monkeypatch.setattr(daily_brief.send_email, "run", lambda preview: calls.append(("send", preview)))
-    assert daily_brief.run_pipeline(preview=True, from_input=from_input)
-    assert calls == (["generate", ("send", True)] if from_input else ["collect", "generate", ("send", True)])
+    assert daily_brief.run_pipeline(from_input=from_input)
+    assert calls == (["generate"] if from_input else ["collect", "generate"])
     assert json.loads((tmp_path / "content.json").read_text())["homework"] == []
 
 
 @pytest.mark.parametrize("stage", ["collect", "generate"])
-def test_pipeline_replaces_stale_content_with_warning_and_still_delivers(monkeypatch, tmp_path, stage):
+def test_pipeline_failure_preserves_previous_content(monkeypatch, tmp_path, stage, caplog):
     content_path = tmp_path / "content.json"
     content_path.write_text('{"homework": ["stale"]}')
     monkeypatch.setattr(daily_brief.generate_brief, "CONTENT_PATH", content_path)
     data = {"portal": {"messages": [], "error": "portal unavailable"}}
     def fail(*args, **kwargs):
-        raise RuntimeError("sensitive detail that should not be emailed")
+        raise RuntimeError("sensitive detail")
     monkeypatch.setattr(daily_brief, "run", fail if stage == "collect" else lambda: data)
     monkeypatch.setattr(daily_brief.generate_brief, "generate", fail if stage == "generate" else lambda *args, **kwargs: daily_brief.generate_brief.empty_brief("date", []))
-    sent = []
-    monkeypatch.setattr(daily_brief.send_email, "run", lambda preview: sent.append(preview))
     assert not daily_brief.run_pipeline()
-    result = json.loads(content_path.read_text())
-    assert result["homework"] == []
-    assert "RuntimeError" in result["warnings"][-1]
-    assert "sensitive detail" not in content_path.read_text()
-    assert sent == [False]
+    assert content_path.read_text() == '{"homework": ["stale"]}'
+    assert "Brief generation failed (RuntimeError)" in caplog.text
+    assert "sensitive detail" not in caplog.text

@@ -228,6 +228,7 @@ def test_pdf_size_limit_and_data_uri(evolution, monkeypatch):
     ("EVOLUTION_API_URL", "http://user:password@example.test"),
     ("EVOLUTION_API_URL", "https://example.test?apikey=secret"),
     ("WHATSAPP_SOURCE", "typo"),
+    ("WHATSAPP_SOURCE", "email"),
 ])
 def test_invalid_configuration_fails_before_network(evolution, monkeypatch, name, value):
     state, _, _ = evolution
@@ -237,13 +238,13 @@ def test_invalid_configuration_fails_before_network(evolution, monkeypatch, name
     assert state["requests"] == []
 
 
-def test_email_source_still_uses_existing_importer(monkeypatch):
-    monkeypatch.setenv("WHATSAPP_SOURCE", "email")
+def test_evolution_is_the_default_source(monkeypatch):
+    monkeypatch.delenv("WHATSAPP_SOURCE", raising=False)
     cutoff = datetime.now(timezone.utc)
     calls = []
-    monkeypatch.setattr(fetch_whatsapp, "_fetch_recent_email_messages", lambda **kwargs: calls.append(kwargs) or [])
+    monkeypatch.setattr(fetch_whatsapp, "fetch_recent_evolution_messages", lambda *args: calls.append(args) or [])
     assert fetch_whatsapp.fetch_recent_whatsapp_messages(cutoff=cutoff) == []
-    assert calls == [{"lookback_hours": None, "cutoff": cutoff}]
+    assert calls == [(cutoff, fetch_whatsapp.ATTACHMENTS_DIR)]
 
 
 def test_admin_creates_read_only_instance(evolution):

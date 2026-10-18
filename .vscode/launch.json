@@ -15,6 +15,24 @@
             },
             "subProcess": true,
             "justMyCode": true
+        },
+        {
+            "name": "Debug: Evolution API",
+            "type": "node",
+            "request": "launch",
+            "runtimeExecutable": "node",
+            "program": "${workspaceFolder}/../evolution-api/dist/main.js",
+            "cwd": "${workspaceFolder}/../evolution-api",
+            "console": "internalConsole",
+            "internalConsoleOptions": "openOnSessionStart",
+            "skipFiles": ["<node_internals>/**"]
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Debug: service + Evolution",
+            "configurations": ["Debug: service.py", "Debug: Evolution API"],
+            "stopAll": true
         }
     ]
 }

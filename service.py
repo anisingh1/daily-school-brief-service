@@ -22,7 +22,6 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import daily_brief
 import generate_brief
 import portal_archive
-import send_email
 
 LOGGER = logging.getLogger(__name__)
 
@@ -90,11 +89,12 @@ def create_app() -> FastAPI:
             data = daily_brief.run()
             summary = prepare_storage(data)
             LOGGER.info("Collection completed; generating saved brief")
-            content = generate_brief.run(data=data, now=datetime.now(portal_archive.IST))
+            content, reused = generate_brief.run_with_status(data=data, now=datetime.now(portal_archive.IST))
             warnings = list(dict.fromkeys(summary.pop("warnings", []) + content.warnings))
             application.state.last_poll = {
                 "at": format_poll_time(datetime.now(timezone)), **summary,
-                "brief_generated": True, "duration_seconds": round(monotonic() - started, 2),
+                "brief_generated": not reused, "brief_reused": reused,
+                "duration_seconds": round(monotonic() - started, 2),
             }
             LOGGER.info("Collection and brief generation completed in %.2fs", monotonic() - started)
             return {**application.state.last_poll, "warnings": warnings}
@@ -232,24 +232,6 @@ def create_app() -> FastAPI:
         except Exception as error:
             LOGGER.error("Reading saved brief failed (%s)", type(error).__name__)
             raise HTTPException(status_code=502, detail=f"Saved brief unavailable ({type(error).__name__})") from error
-
-    @application.post("/email-brief", dependencies=[Depends(authorize)])
-    def email_brief() -> dict[str, str]:
-        if not operation_lock.acquire(blocking=False):
-            raise HTTPException(status_code=409, detail="Another storage operation is running; retry later")
-        try:
-            if not send_email.CONTENT_PATH.exists():
-                raise HTTPException(status_code=409, detail="Generate a brief first with POST /refresh")
-            generate_brief.validate_brief_content(send_email.CONTENT_PATH.read_text(encoding="utf-8"))
-            send_email.run()
-            return {"status": "sent"}
-        except HTTPException:
-            raise
-        except Exception as error:
-            LOGGER.error("Email delivery failed (%s)", type(error).__name__)
-            raise HTTPException(status_code=502, detail=f"Email delivery failed ({type(error).__name__})") from error
-        finally:
-            operation_lock.release()
 
     return application
 

@@ -1,6 +1,5 @@
 """
-Collects school messages, generates a validated brief with Azure OpenAI,
-and renders/sends it using the existing email scripts.
+Collects school messages and generates a validated brief with Azure OpenAI.
 
 Each source is best-effort: on failure, its `error` field is set and
 retained local messages are still used. Both sources are stored as JSON
@@ -14,13 +13,13 @@ Storage is local and ignored by Git. Keep data/ on persistent storage.
 
 USAGE:
     python daily_brief.py
-    python daily_brief.py --preview
-    python daily_brief.py --from-input --preview
+    python daily_brief.py --from-input
     python daily_brief.py --gather-only
 """
 
 import argparse
 import json
+import logging
 from calendar import monthrange
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,7 +27,6 @@ from typing import Any, Literal, NotRequired, TypedDict
 
 import generate_brief
 import portal_archive
-import send_email
 from fetch_whatsapp import fetch_recent_whatsapp_messages
 from portal_archive import (
     compute_portal_cutoff,
@@ -127,50 +125,38 @@ def run(initialize: bool = False, source: Literal["portal", "whatsapp"] | None =
     return data
 
 
-def run_pipeline(preview: bool = False, from_input: bool = False) -> bool:
+def run_pipeline(from_input: bool = False) -> bool:
     now = datetime.now(generate_brief.IST)
     data: dict[str, Any] = {}
-    warnings: list[str] = []
-    succeeded = True
     try:
         if from_input:
             data = generate_brief.load_stored_input(now)
         else:
             data = run()
         generate_brief.run(data=data, now=now)
-    except Exception as error:  # noqa: BLE001 - pipeline failures must produce a warning-only brief
-        succeeded = False
+    except Exception as error:  # noqa: BLE001 - report failure without replacing the last good brief
         status_code = getattr(error, "status_code", None)
         reason = type(error).__name__
         if status_code is not None:
             reason += f", HTTP {status_code}"
-        warnings.extend(
-            f"{source_name}: {source['error']}"
-            for source_name, source in data.items() if source.get("error")
+        logging.getLogger(__name__).error(
+            "Brief generation failed (%s); previous saved brief was preserved. "
+            "Check source availability and Azure configuration.", reason,
         )
-        warnings.append(f"Brief generation failed ({reason}). Check source availability and Azure configuration.")
-        content = generate_brief.empty_brief(generate_brief.date_context(now)["brief_date"], [])
-        content.calendar = generate_brief.normalize_calendar(
-            content, now.date(), {}, data.get("attendance", {}).get("records", []),
-        )
-        content.warnings = list(dict.fromkeys(content.warnings + warnings))
-        generate_brief.write_content(content)
-        print(f"Wrote {generate_brief.CONTENT_PATH}")
-    send_email.run(preview=preview)
-    return succeeded
+        return False
+    return True
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate the daily school brief with Azure OpenAI.")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--gather-only", action="store_true", help="Collect messages without calling Azure or sending email.")
+    mode.add_argument("--gather-only", action="store_true", help="Collect messages without calling Azure.")
     mode.add_argument("--from-input", action="store_true", help="Reuse saved input without fetching messages.")
-    parser.add_argument("--preview", action="store_true", help="Write HTML without sending email.")
     args = parser.parse_args()
     if args.gather_only:
         run()
         return 0
-    return 0 if run_pipeline(args.preview, args.from_input) else 1
+    return 0 if run_pipeline(args.from_input) else 1
 
 
 if __name__ == "__main__":
