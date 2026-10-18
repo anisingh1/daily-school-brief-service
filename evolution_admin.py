@@ -1,14 +1,13 @@
 """Pair Evolution with WhatsApp and select a school group without printing API keys."""
 
 import argparse
-import base64
 import os
 from pathlib import Path
 from urllib.parse import quote
 
 from dotenv import load_dotenv, set_key
 
-from fetch_evolution import create_client, load_settings
+from fetch_evolution import connection_state, create_client, load_settings, pairing_qr
 
 ROOT = Path(__file__).parent
 ENV_PATH = ROOT / ".env"
@@ -30,22 +29,15 @@ def run(command: str, group_jid: str | None = None) -> None:
             response.raise_for_status()
             print("Created Evolution instance. Run the pair command next.")
         elif command == "pair":
-            response = client.get(f"instance/connect/{instance}")
-            response.raise_for_status()
-            result = response.json()
-            if not isinstance(result, dict):
-                raise ValueError("Evolution returned an invalid pairing response")
-            if result.get("instance", {}).get("state") == "open":
+            try:
+                image = pairing_qr(client, instance)
+            except (ValueError, RuntimeError):
+                QR_PATH.unlink(missing_ok=True)
+                raise
+            if image is None:
                 QR_PATH.unlink(missing_ok=True)
                 print("WhatsApp is already connected. Run the groups command next.")
                 return
-            encoded = result.get("base64")
-            if not isinstance(encoded, str) or not encoded:
-                QR_PATH.unlink(missing_ok=True)
-                raise ValueError("No QR code available yet; retry the pair command shortly")
-            image = base64.b64decode(encoded.removeprefix("data:image/png;base64,"), validate=True)
-            if not image.startswith(b"\x89PNG\r\n\x1a\n"):
-                raise ValueError("Evolution returned an invalid QR image")
             QR_PATH.parent.mkdir(parents=True, exist_ok=True)
             descriptor = os.open(QR_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(descriptor, "wb") as stream:
@@ -53,9 +45,7 @@ def run(command: str, group_jid: str | None = None) -> None:
             print(f"Open {QR_PATH} and scan it in WhatsApp > Linked devices > Link a device.")
             print("QR codes expire; rerun pair to refresh. Do not share this image.")
         elif command == "status":
-            response = client.get(f"instance/connectionState/{instance}")
-            response.raise_for_status()
-            state = response.json()["instance"]["state"]
+            state = connection_state(client, instance)
             print(f"WhatsApp connection: {state}")
             if state != "open":
                 raise RuntimeError("WhatsApp is not connected; run the pair command")

@@ -39,6 +39,16 @@ Python. HTTP readiness does not itself guarantee WhatsApp is linked:
 docker compose exec brief python evolution_admin.py status
 ```
 
+For cloud relinking, the Python API also provides authenticated
+`POST /whatsapp/qr`, returning the PNG directly. There is no need to expose
+Evolution publicly or download a file from its volume. Use the Docker API token
+(`DOCKER_SERVICE_API_TOKEN`) and inspect HTTP status before displaying the
+response: 202 means retry shortly, and 409 can mean already connected or busy.
+`GET /health?check_connections=true` actively verifies UDT and WhatsApp;
+ordinary `/health` only returns cached observations, so Docker's frequent
+health probes do not repeatedly log in to UDT. See the
+[API details](../README.md#whatsapp-qr-pairing-api).
+
 Named volumes hold the PostgreSQL database, Redis persistence, Evolution
 instances/store, and Python data/output. Inspect their ownership with:
 
@@ -79,6 +89,10 @@ changing the database role password; changing `.env` alone is insufficient.
 Compose overrides only container-specific settings: service bind/reload,
 Evolution's internal address, and the API token. Native `SERVICE_API_TOKEN`
 is unchanged; Docker HTTP clients use `DOCKER_SERVICE_API_TOKEN`. The usual
+bearer token is required for all data/control routes, including health and PDF
+downloads. Missing server-token configuration fails closed with HTTP 503,
+including native debugging and direct ASGI launches. Frontends must fetch PDF
+links with an authorization header; plain unauthenticated links no longer work.
 Azure/portal/WhatsApp settings remain required. No `.env`, school data, or
 native session is copied into either image.
 
@@ -144,19 +158,33 @@ up -d --wait` to resume the Docker Python service.
 
 ### Fully native Python and Evolution
 
-First run `docker compose down`. Restart your native database services, then
-select **Debug: service + Evolution**. On the prepared Mac, the preserved
-native services can be started with:
+First run `docker compose down`, then select **Debug: service + Evolution**.
+Both this compound and the Evolution-only launch now run **Native: prepare
+Evolution** before starting Node. The task checks that port 8080 is free,
+starts/reuses the preserved PostgreSQL server, starts/reuses the Redis
+LaunchAgent, and waits for both databases to be ready. It fails explicitly
+rather than starting another Evolution when Docker already owns the port.
+
+To start just the native databases, use **Tasks: Run Task > Native: start
+databases**, or:
 
 ```bash
-"$HOME/.local/share/mise/installs/postgres/14.9/bin/pg_ctl" \
-  -D "$HOME/.local/share/postgres-neo" \
-  -l "$HOME/.local/share/postgres-neo/server.log" start
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/sh.brew.redis.plist"
+bash scripts/start_native_databases.sh
 ```
 
-These are machine-specific paths, not required for Docker. Run each only if
-its service is stopped. The Redis job was unloaded, not disabled: it may
+The helper is configured for this Mac's existing mise PostgreSQL 14.9 and
+Homebrew Redis installations, not required for Docker. Set
+`NATIVE_POSTGRES_BIN` and `NATIVE_POSTGRES_DATA` in the task environment if those
+PostgreSQL paths change. It never initializes a new database, flushes Redis,
+or stops existing services. Repeated runs reuse ready servers.
+When the Evolution debug session ends (including through the combined launch),
+its **Native: stop databases** post-debug task gracefully stops PostgreSQL and
+unloads the Redis LaunchAgent so it cannot immediately restart Redis.
+This also stops servers that were already running before debugging; avoid
+sharing these native databases with other projects during a debug session.
+The stop task is safe to repeat and can also be run manually after using
+**Native: start databases**. It does not delete data or affect Docker containers.
+The Redis job was unloaded, not disabled: it may
 also load again at the next user login. Neither native database port conflicts
 with Docker because the container databases are private.
 
@@ -166,5 +194,5 @@ entries are retained. Full native Evolution uses the pre-migration session
 snapshot, not subsequent Docker changes. Check `evolution_admin.py status`
 after switching; a stale/revoked login may need relinking.
 
-Stop the native debug sessions before returning to Docker. Native databases
-can remain available for other local projects; they are not Docker dependencies.
+Stop the native debug sessions before returning to Docker. The post-debug task
+stops the native databases; they are not Docker dependencies.

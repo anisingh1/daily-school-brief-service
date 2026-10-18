@@ -105,6 +105,41 @@ def create_client(settings: dict[str, str]) -> httpx.Client:
     )
 
 
+def connection_state(client: httpx.Client, instance: str) -> str:
+    response = client.get(f"instance/connectionState/{instance}", timeout=10)
+    response.raise_for_status()
+    state = _object(_object(response.json(), "connection response").get("instance"), "instance").get("state")
+    if state is None:
+        return "initializing"
+    if not isinstance(state, str) or state not in {"open", "close", "connecting"}:
+        raise ValueError("Evolution returned an invalid connection state")
+    return state
+
+
+class PairingPending(ValueError):
+    pass
+
+
+def pairing_qr(client: httpx.Client, instance: str) -> bytes | None:
+    response = client.get(f"instance/connect/{instance}", timeout=10)
+    response.raise_for_status()
+    result = _object(response.json(), "pairing response")
+    if result.get("error"):
+        raise RuntimeError("Evolution could not initiate pairing")
+    instance_data = result.get("instance")
+    if instance_data is not None and _object(instance_data, "pairing instance").get("state") == "open":
+        return None
+    encoded = result.get("base64")
+    if encoded is None or encoded == "":
+        raise PairingPending("No QR code available yet; retry shortly")
+    if not isinstance(encoded, str) or len(encoded) > 3 * 1024 * 1024:
+        raise ValueError("Evolution returned invalid or oversized QR data")
+    image = base64.b64decode(encoded.removeprefix("data:image/png;base64,"), validate=True)
+    if not image.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("Evolution returned an invalid QR image")
+    return image
+
+
 def fetch_recent_evolution_messages(cutoff: datetime, save_dir: Path) -> list[dict[str, Any]]:
     settings = load_settings()
     group = os.getenv("EVOLUTION_GROUP_JID", "").strip()
@@ -118,9 +153,7 @@ def fetch_recent_evolution_messages(cutoff: datetime, save_dir: Path) -> list[di
     until = datetime.now(timezone.utc)
     messages: dict[str, dict[str, Any]] = {}
     with create_client(settings) as client:
-        response = client.get(f"instance/connectionState/{instance}")
-        response.raise_for_status()
-        state = _object(_object(response.json(), "connection response").get("instance"), "instance").get("state")
+        state = connection_state(client, instance)
         if state != "open":
             raise RuntimeError("Evolution WhatsApp instance is disconnected; reconnect it before collecting")
         for page in range(1, 10001):

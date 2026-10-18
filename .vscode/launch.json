@@ -20,6 +20,8 @@
             "name": "Debug: Evolution API",
             "type": "node",
             "request": "launch",
+            "preLaunchTask": "Native: prepare Evolution",
+            "postDebugTask": "Native: stop databases",
             "runtimeExecutable": "node",
             "program": "${workspaceFolder}/../evolution-api/dist/main.js",
             "cwd": "${workspaceFolder}/../evolution-api",

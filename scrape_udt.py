@@ -21,6 +21,7 @@ import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -116,7 +117,7 @@ def extract_messages(html: str) -> list[dict]:
 # Fetching
 # ---------------------------------------------------------------------------
 
-def login(session) -> None:
+def login(session, *, timeout: float | None = None) -> requests.Response:
     if not USERNAME or not PASSWORD:
         raise RuntimeError(
             "UDT_USERNAME and/or UDT_PASSWORD are not set. "
@@ -126,14 +127,27 @@ def login(session) -> None:
         LOGIN_URL,
         data={"username": USERNAME, "password": PASSWORD},
         allow_redirects=True,
+        timeout=timeout,
     )
     resp.raise_for_status()
-    if 'id="login-form"' in resp.text:
+    if BeautifulSoup(resp.text, "html.parser").select_one("#login-form"):
         raise RuntimeError(
             "Login appears to have failed - check UDT_USERNAME/UDT_PASSWORD in .env, "
             "or the site may need additional hidden form fields not seen "
             "in the static HTML (check the Network tab's Form Data on submit)."
         )
+    return resp
+
+
+def check_connection() -> None:
+    with requests.Session() as session:
+        session.headers.update(HEADERS)
+        response = login(session, timeout=10)
+        target = urlsplit(response.url)
+        base = urlsplit(BASE_URL)
+        dashboard = base.path.rstrip("/") + "/user-dash-boards/parent"
+        if target.netloc != base.netloc or target.path.rstrip("/") != dashboard:
+            raise RuntimeError("Portal login did not reach the authenticated parent dashboard")
 
 
 def fetch_activity_messages(session) -> list[dict]:

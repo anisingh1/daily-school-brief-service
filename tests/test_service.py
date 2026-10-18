@@ -9,12 +9,26 @@ from fastapi.testclient import TestClient
 import service
 
 
+PROTECTED_ROUTES = [
+    ("GET", "/health"),
+    ("GET", "/health?check_connections=true"),
+    ("GET", "/brief"),
+    ("POST", "/brief"),
+    ("POST", "/refresh"),
+    ("POST", "/initialize"),
+    ("POST", "/scrape-udt"),
+    ("POST", "/fetch-whatsapp"),
+    ("POST", "/whatsapp/qr"),
+    ("GET", "/pdfs/worksheet.pdf"),
+]
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(service.daily_brief, "fetch_attendance", lambda *args: [])
     monkeypatch.setenv("MESSAGE_POLL_CRON", "0 18 * * *")
     monkeypatch.setenv("MESSAGE_POLL_TIMEZONE", "Asia/Kolkata")
-    monkeypatch.delenv("SERVICE_API_TOKEN", raising=False)
+    monkeypatch.setenv("SERVICE_API_TOKEN", "test-token")
     monkeypatch.setattr(service.portal_archive, "DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(service.portal_archive, "ARCHIVE_PATH", tmp_path / "data" / "portal_messages.json")
     monkeypatch.setattr(service.portal_archive, "WHATSAPP_ARCHIVE_PATH", tmp_path / "data" / "whatsapp_messages.json")
@@ -26,7 +40,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(service.daily_brief, "fetch_recent_messages", lambda **kwargs: pytest.fail("Unexpected portal fetch"))
     monkeypatch.setattr(service.daily_brief, "fetch_recent_whatsapp_messages", lambda **kwargs: pytest.fail("Unexpected Evolution fetch"))
     monkeypatch.setattr(service.generate_brief, "create_client", lambda: pytest.fail("Unexpected Azure call"))
-    with TestClient(service.create_app()) as test_client:
+    with TestClient(service.create_app(), headers={"Authorization": "Bearer test-token"}) as test_client:
         yield test_client
 
 
@@ -54,7 +68,7 @@ def test_favicon_returns_no_content_without_authentication(monkeypatch):
     assert "/favicon.ico" not in application.openapi()["paths"]
 
 
-def test_pdf_links_serve_saved_files_without_authentication(tmp_path, monkeypatch):
+def test_pdf_links_require_authentication_and_serve_saved_files(tmp_path, monkeypatch):
     monkeypatch.setenv("SERVICE_API_TOKEN", "test-token")
     monkeypatch.setattr(service.generate_brief, "PDF_DIR", tmp_path / "pdfs")
     service.generate_brief.PDF_DIR.mkdir()
@@ -62,7 +76,8 @@ def test_pdf_links_serve_saved_files_without_authentication(tmp_path, monkeypatc
     path.write_bytes(b"%PDF-1.4\n")
     test_client = TestClient(service.create_app())
     assert test_client.get("/health").status_code == 401
-    response = test_client.get("/pdfs/Hindi%20worksheet.pdf")
+    assert test_client.get("/pdfs/Hindi%20worksheet.pdf").status_code == 401
+    response = test_client.get("/pdfs/Hindi%20worksheet.pdf", headers={"Authorization": "Bearer test-token"})
     assert response.status_code == 200
     assert response.content == path.read_bytes()
     assert response.headers["content-type"] == "application/pdf"
@@ -631,14 +646,32 @@ def test_api_token_is_required_when_configured(monkeypatch):
     monkeypatch.setenv("SERVICE_API_TOKEN", "test-token")
     monkeypatch.setenv("MESSAGE_POLL_CRON", "0 0 1 1 *")
     with TestClient(service.create_app()) as client:
-        assert client.get("/health").status_code == 401
-        assert client.get("/brief").status_code == 401
-        assert client.post("/refresh").status_code == 401
-        assert client.post("/brief", headers={"Authorization": "Bearer wrong"}).status_code == 401
-        assert client.post("/initialize").status_code == 401
-        assert client.post("/scrape-udt").status_code == 401
-        assert client.post("/fetch-whatsapp").status_code == 401
+        for method, path in PROTECTED_ROUTES:
+            for headers in ({}, {"Authorization": "Bearer wrong"}, {"Authorization": "Basic test-token"}):
+                response = client.request(method, path, headers=headers)
+                assert response.status_code == 401
+                assert response.headers["www-authenticate"] == "Bearer"
+                assert response.headers["cache-control"] == "no-store"
         assert client.get("/health", headers={"Authorization": "Bearer test-token"}).status_code == 200
+
+
+@pytest.mark.parametrize("token", [None, "", " \t "])
+@pytest.mark.parametrize("method,path", PROTECTED_ROUTES)
+def test_direct_asgi_app_rejects_unconfigured_token(monkeypatch, token, method, path):
+    if token is None:
+        monkeypatch.delenv("SERVICE_API_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("SERVICE_API_TOKEN", token)
+    monkeypatch.setenv("SERVICE_HOST", "0.0.0.0")
+    monkeypatch.setattr(service.daily_brief, "run", lambda **kwargs: pytest.fail("Unexpected collection"))
+    monkeypatch.setattr(service.generate_brief, "create_client", lambda: pytest.fail("Unexpected Azure call"))
+    application = service.create_app()
+    test_client = TestClient(application)
+    response = test_client.request(method, path)
+    assert response.status_code == 503
+    assert "Configure SERVICE_API_TOKEN" in response.json()["detail"]
+    assert response.headers["cache-control"] == "no-store"
+    assert not application.state.operation_lock.locked()
 
 
 @pytest.mark.parametrize("reload_enabled", [False, True])

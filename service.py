@@ -8,22 +8,34 @@ from datetime import datetime, timedelta
 from secrets import compare_digest
 from threading import Lock
 from time import monotonic
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypedDict
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import uvicorn
+import httpx
+import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.base import BaseTrigger
 from croniter import croniter
 from fastapi import Depends, FastAPI, HTTPException, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 import daily_brief
+import fetch_evolution
 import generate_brief
 import portal_archive
+import scrape_udt as portal
 
 LOGGER = logging.getLogger(__name__)
+
+
+class ConnectionStatus(TypedDict):
+    connected: bool | None
+    state: str
+    checked_at: str | None
+    error: str | None
 
 
 def format_poll_time(timestamp: datetime) -> str:
@@ -81,12 +93,48 @@ def create_app() -> FastAPI:
     operation_lock = Lock()
     scheduler = BackgroundScheduler(timezone=timezone)
 
+    def record_connection(name: str, connected: bool | None, state: str, error: str | None = None) -> None:
+        status: ConnectionStatus = {
+            "connected": connected, "state": state,
+            "checked_at": datetime.now(timezone).isoformat(), "error": error,
+        }
+        application.state.connections = {**application.state.connections, name: status}
+
+    def record_collection_connections(data: dict[str, Any], sources: tuple[str, ...]) -> None:
+        for source in sources:
+            if source not in data:
+                continue
+            name = "udt" if source == "portal" else "whatsapp"
+            if data[source].get("error"):
+                record_connection(name, None, "collection_failed", "CollectionFailed")
+            else:
+                record_connection(name, True, "authenticated" if source == "portal" else "open")
+
+    def probe_connections() -> None:
+        try:
+            portal.check_connection()
+        except (requests.RequestException, ValueError, RuntimeError) as error:
+            LOGGER.warning("UDT connection check failed (%s)", type(error).__name__)
+            record_connection("udt", False, "error", type(error).__name__)
+        else:
+            record_connection("udt", True, "authenticated")
+        try:
+            settings = fetch_evolution.load_settings()
+            with fetch_evolution.create_client(settings) as client:
+                state = fetch_evolution.connection_state(client, quote(settings["EVOLUTION_INSTANCE"], safe=""))
+        except (httpx.HTTPError, ValueError, TypeError, RuntimeError) as error:
+            LOGGER.warning("WhatsApp connection check failed (%s)", type(error).__name__)
+            record_connection("whatsapp", False, "error", type(error).__name__)
+        else:
+            record_connection("whatsapp", state == "open", state)
+
     def collect_and_generate() -> dict[str, Any]:
         if not operation_lock.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="Another storage operation is running; retry later")
         started = monotonic()
         try:
             data = daily_brief.run()
+            record_collection_connections(data, ("portal", "whatsapp"))
             summary = prepare_storage(data)
             LOGGER.info("Collection completed; generating saved brief")
             content, reused = generate_brief.run_with_status(data=data, now=datetime.now(portal_archive.IST))
@@ -131,6 +179,10 @@ def create_app() -> FastAPI:
     application.state.operation_lock = operation_lock
     application.state.scheduler = scheduler
     application.state.last_poll = None
+    application.state.connections = {
+        name: ConnectionStatus(connected=None, state="unknown", checked_at=None, error=None)
+        for name in ("udt", "whatsapp")
+    }
 
     @application.get("/favicon.ico", include_in_schema=False, status_code=204)
     def favicon() -> Response:
@@ -139,11 +191,14 @@ def create_app() -> FastAPI:
     def authorize(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(HTTPBearer(auto_error=False))],
     ) -> None:
-        if token and (credentials is None or not compare_digest(credentials.credentials, token)):
+        if not token:
+            raise HTTPException(status_code=503, detail="Configure SERVICE_API_TOKEN before accessing the API",
+                                headers={"Cache-Control": "no-store"})
+        if credentials is None or not compare_digest(credentials.credentials, token):
             raise HTTPException(status_code=401, detail="A valid bearer token is required",
-                                headers={"WWW-Authenticate": "Bearer"})
+                                headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"})
 
-    @application.get("/pdfs/{filename}", response_class=FileResponse)
+    @application.get("/pdfs/{filename}", response_class=FileResponse, dependencies=[Depends(authorize)])
     def read_pdf(filename: str) -> FileResponse:
         directory = generate_brief.PDF_DIR.resolve()
         path = (directory / filename).resolve()
@@ -153,15 +208,58 @@ def create_app() -> FastAPI:
                             content_disposition_type="inline")
 
     @application.get("/health", dependencies=[Depends(authorize)])
-    def health() -> dict[str, Any]:
+    def health(check_connections: bool = False) -> dict[str, Any]:
+        if check_connections:
+            if not operation_lock.acquire(blocking=False):
+                raise HTTPException(status_code=409, detail="Another operation is running; retry the connection check later")
+            try:
+                probe_connections()
+            finally:
+                operation_lock.release()
         job = scheduler.get_job("collect_messages")
+        now = datetime.now(timezone)
         return {
             "status": "ok", "initialized": portal_archive.ARCHIVE_PATH.exists(),
             "cron": cron, "timezone": str(timezone),
             "retention_days": portal_archive.RETENTION_DAYS,
             "next_poll": format_poll_time(job.next_run_time) if job and job.next_run_time else None,
             "busy": operation_lock.locked(), "last_poll": application.state.last_poll,
+            "connections": {
+                name: {**status, "stale": status["checked_at"] is None or
+                       now - datetime.fromisoformat(status["checked_at"]) > timedelta(minutes=5)}
+                for name, status in application.state.connections.items()
+            },
         }
+
+    @application.post("/whatsapp/qr", response_class=Response, dependencies=[Depends(authorize)],
+                      responses={200: {"content": {"image/png": {}}, "description": "WhatsApp pairing QR PNG"},
+                                 202: {"description": "QR not ready; retry shortly"},
+                                 409: {"description": "Already connected, or another operation is running"}})
+    def whatsapp_qr() -> Response:
+        headers = {"Cache-Control": "no-store", "Pragma": "no-cache", "X-Content-Type-Options": "nosniff"}
+        if not operation_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="Another operation is running; retry later", headers=headers)
+        try:
+            settings = fetch_evolution.load_settings()
+            with fetch_evolution.create_client(settings) as client:
+                image = fetch_evolution.pairing_qr(client, quote(settings["EVOLUTION_INSTANCE"], safe=""))
+            if image is None:
+                record_connection("whatsapp", True, "open")
+                raise HTTPException(status_code=409, detail="WhatsApp is already connected; no QR scan is needed",
+                                    headers=headers)
+            record_connection("whatsapp", False, "qr_required")
+            return Response(image, media_type="image/png", headers=headers)
+        except fetch_evolution.PairingPending:
+            record_connection("whatsapp", False, "connecting")
+            return JSONResponse(status_code=202, content={"status": "pending", "detail": "QR not ready; retry shortly"},
+                                headers={**headers, "Retry-After": "2"})
+        except (httpx.HTTPError, ValueError, TypeError, RuntimeError) as error:
+            LOGGER.warning("WhatsApp pairing failed (%s)", type(error).__name__)
+            record_connection("whatsapp", None, "error", type(error).__name__)
+            raise HTTPException(status_code=502, detail=f"WhatsApp pairing failed ({type(error).__name__})",
+                                headers=headers) from error
+        finally:
+            operation_lock.release()
 
     @application.post("/initialize", dependencies=[Depends(authorize)])
     def initialize_storage() -> dict[str, Any]:
@@ -169,6 +267,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=409, detail="Another storage operation is running; retry later")
         try:
             data = daily_brief.run(initialize=True)
+            record_collection_connections(data, ("portal", "whatsapp"))
             if data["portal"].get("error"):
                 raise HTTPException(status_code=502, detail="Portal initialization failed; existing storage was preserved")
             return prepare_storage(data)
@@ -185,6 +284,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=409, detail="Another storage operation is running; retry later")
         try:
             data = daily_brief.run(source=source)
+            record_collection_connections(data, (source,))
             if data[source].get("error"):
                 raise HTTPException(status_code=502, detail=f"{source} collection failed; cursor was not advanced")
             collected: dict[str, Any] = {source: data[source]}

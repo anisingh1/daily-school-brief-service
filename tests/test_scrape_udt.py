@@ -105,6 +105,49 @@ def test_login_raises_on_failed_login():
         login(FakeSession())
 
 
+@pytest.mark.parametrize(("url", "text", "succeeds"), [
+    ("https://portal.test/user-dash-boards/parent", "<html>Parent dashboard</html>", True),
+    ("https://portal.test/user-dash-boards/parent/", "<html>Parent dashboard</html>", True),
+    ("https://portal.test/Logins/index", "<html>Login unavailable</html>", False),
+    ("https://other.test/user-dash-boards/parent", "<html>Dashboard</html>", False),
+    ("https://portal.test/user-dash-boards/parent", "<form id='login-form'></form>", False),
+])
+def test_connection_probe_validates_login_without_fetching_messages(monkeypatch, url, text, succeeds):
+    from types import SimpleNamespace
+    import scrape_udt
+
+    calls = []
+    response = SimpleNamespace(url=url, text=text, raise_for_status=lambda: None)
+
+    class Session:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            calls.append("close")
+
+        def post(self, target, **kwargs):
+            calls.append(("login", target, kwargs["timeout"]))
+            return response
+
+        def get(self, *args, **kwargs):
+            pytest.fail("Connection probe must not collect messages or attachments")
+
+    monkeypatch.setattr(scrape_udt, "BASE_URL", "https://portal.test")
+    monkeypatch.setattr(scrape_udt, "LOGIN_URL", "https://portal.test/Logins/index")
+    monkeypatch.setattr(scrape_udt, "USERNAME", "test-user")
+    monkeypatch.setattr(scrape_udt, "PASSWORD", "test-password")
+    monkeypatch.setattr(scrape_udt.requests, "Session", Session)
+    if succeeds:
+        assert scrape_udt.check_connection() is None
+    else:
+        with pytest.raises(RuntimeError):
+            scrape_udt.check_connection()
+    assert calls == [("login", "https://portal.test/Logins/index", 10), "close"]
+
+
 class _FakeSession:
     def __init__(self):
         self.headers = {}

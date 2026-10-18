@@ -97,6 +97,21 @@ most two SDK retries.
 
 ## Scheduled Service
 
+Set a strong random `SERVICE_API_TOKEN` in the private `.env` before using the
+native API (generate one with `openssl rand -hex 32`). Docker instead requires
+`DOCKER_SERVICE_API_TOKEN`. Every data/control endpoint, including `/health`,
+PDF downloads, and pairing, requires `Authorization: Bearer <token>`, even on
+localhost. Missing or invalid credentials return HTTP 401; an unconfigured or
+blank server token returns HTTP 503 rather than disabling authentication,
+including when launched directly through an ASGI server.
+The favicon and API documentation/schema remain public; they contain no school
+data. In `/docs`, use **Authorize** to supply the bearer token.
+
+The curl examples below assume `SERVICE_API_TOKEN` is exported in your client
+shell with the matching native token (or the Docker token when using Docker).
+The server loads `.env` itself, but that does not export variables into your shell.
+Never put the token in a URL or commit it to source control.
+
 After setup, start the service in a terminal from the repository root:
 
 ```bash
@@ -129,7 +144,7 @@ Initialize storage once after starting, or repeat safely to refresh messages
 within the configured lookback window:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/initialize
+curl -X POST http://127.0.0.1:8000/initialize -H "Authorization: Bearer $SERVICE_API_TOKEN"
 ```
 
 This ignores both source cursors, filters exposed messages to the lookback
@@ -167,8 +182,8 @@ uses retained messages with a warning rather than claiming fresh data.
 Collect just one source on demand:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/scrape-udt
-curl -X POST http://127.0.0.1:8000/fetch-whatsapp
+curl -X POST http://127.0.0.1:8000/scrape-udt -H "Authorization: Bearer $SERVICE_API_TOKEN"
+curl -X POST http://127.0.0.1:8000/fetch-whatsapp -H "Authorization: Bearer $SERVICE_API_TOKEN"
 ```
 
 Portal and Evolution fetch messages strictly newer than that source's last
@@ -184,7 +199,7 @@ to backfill storage. All collection routes share the scheduler's storage lock.
 Run the exact cron workflow manually, including collection and generation:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/refresh
+curl -X POST http://127.0.0.1:8000/refresh -H "Authorization: Bearer $SERVICE_API_TOKEN"
 ```
 
 This synchronous endpoint fetches both sources, stores messages/PDFs, prepares
@@ -204,9 +219,9 @@ saved content retains warnings for internal diagnostics.
 Read the saved brief without collection, cleanup, or LLM calls:
 
 ```bash
-curl http://127.0.0.1:8000/brief
+curl http://127.0.0.1:8000/brief -H "Authorization: Bearer $SERVICE_API_TOKEN"
 # Existing clients can still use:
-curl -X POST http://127.0.0.1:8000/brief
+curl -X POST http://127.0.0.1:8000/brief -H "Authorization: Bearer $SERVICE_API_TOKEN"
 ```
 
 Both methods return the validated brief JSON without internal warnings. Missing content returns
@@ -321,8 +336,10 @@ pages are not included. The field name is retained for API compatibility.
 ```
 
 Links always use downloaded PDFs via `GET /pdfs/{filename}` on this service.
-PDF downloads require no authentication; anyone who can reach the service and
-knows the URL can access them. Other API routes retain their authentication. Relative links are
+PDF downloads require the same bearer token as other data/control routes.
+Plain browser links without authentication return HTTP 401. Frontends should
+fetch PDFs with the authorization header and display the resulting blob; do not
+append the token to the URL. Relative links are
 resolved against your service URL. Set `SERVICE_PUBLIC_URL` to your trusted,
 reachable HTTP(S) service URL to produce absolute links for API consumers.
 Files must remain under `data/pdfs`; links stop working after retention cleanup.
@@ -339,14 +356,92 @@ For always-on operation, keep the service running under your process supervisor.
 Check the running service:
 
 ```bash
-curl --fail http://127.0.0.1:8000/health
+curl --fail http://127.0.0.1:8000/health -H "Authorization: Bearer $SERVICE_API_TOKEN"
 ```
+
+### Source connection health
+
+`GET /health` includes `connections.udt` and `connections.whatsapp`:
+
+```json
+{
+  "connections": {
+    "udt": {
+      "connected": true,
+      "state": "authenticated",
+      "checked_at": "2026-10-18T20:00:00+05:30",
+      "error": null,
+      "stale": false
+    },
+    "whatsapp": {
+      "connected": true,
+      "state": "open",
+      "checked_at": "2026-10-18T20:00:00+05:30",
+      "error": null,
+      "stale": false
+    }
+  }
+}
+```
+
+These are cached observations, not continuous connections. They start as
+`connected: null`, `state: unknown` after process startup. Successful source
+collections update them; a failed collection reports `connected: null` and
+`state: collection_failed`, because an attachment/storage failure alone does
+not establish that the login is invalid. Results older than five minutes are
+marked `stale`; ordinary health reads never probe dependencies or refresh stale
+results automatically.
+
+Use authenticated `GET /health?check_connections=true` to check both sources
+now. UDT is verified by a bounded login request reaching the parent dashboard;
+it has no permanent login connection. WhatsApp queries Evolution's connection
+state. These checks do not collect messages/PDFs, modify cursors, or call Azure.
+The response remains HTTP 200 with app `status: ok` when a dependency fails,
+but its connection entry reports `connected: false`, `state: error`, and a
+sanitized exception class in `error`. WhatsApp can also report `close`,
+`connecting`, or `initializing` without an error.
+
+A live probe returns HTTP 409 if another collection, generation, or pairing
+operation is active; normal cached health reads remain available. Network
+checks have ten-second request timeouts and can take longer than cached reads.
+Authentication is the same as other protected service routes.
+
+### WhatsApp QR pairing API
+
+`POST /whatsapp/qr` asks Evolution for the current pairing QR. It requires a
+configured `SERVICE_API_TOKEN` and a matching bearer token, including on
+localhost. Docker supplies this from `DOCKER_SERVICE_API_TOKEN`.
+
+```bash
+curl --fail -X POST http://127.0.0.1:8000/whatsapp/qr \
+  -H "Authorization: Bearer $SERVICE_API_TOKEN" \
+  --output output/whatsapp-qr.png
+```
+
+- HTTP 200 returns raw PNG bytes with `Content-Type: image/png`, not JSON/base64.
+  Display the image and scan it in WhatsApp's Linked Devices screen.
+- HTTP 202 returns JSON `status: pending` and `Retry-After: 2`. Wait and retry;
+  do not display this response as an image.
+- HTTP 409 means WhatsApp is already connected (no scan needed), or another
+  operation is busy. The JSON detail distinguishes these cases.
+- HTTP 401 rejects missing/invalid bearer credentials. HTTP 503 means the
+  service API token has not been configured. Upstream/configuration failures
+  or invalid QR data return HTTP 502 without exposing upstream response bodies.
+
+The API never logs out or creates an instance, and does not save the QR on the
+server. QR responses use `Cache-Control: no-store`. Frontends must send the
+bearer token, inspect the status/content type before rendering a blob, avoid
+persistent image caching, and request a new image when it expires. After
+scanning, run the explicit live health check to confirm `whatsapp.connected`.
+Treat the QR as a login credential: keep the endpoint behind HTTPS and
+authentication, do not share images, and delete downloaded copies afterward.
 
 Open `http://127.0.0.1:8000/docs` to try the endpoints interactively. Stop the
 service with Ctrl-C. Restart it after editing `.env`. The default localhost
-binding needs no host, port, or token settings. Optional environment overrides
-remain supported in code for remote access: a non-local binding requires a
-bearer token, and remote exposure should use HTTPS through a reverse proxy.
+binding needs no host or port settings, but still requires `SERVICE_API_TOKEN`.
+Optional environment overrides remain supported in code for remote access:
+a non-local binding requires a bearer token, and remote exposure must use
+HTTPS through a reverse proxy. Keep Evolution, PostgreSQL, and Redis private.
 The service does not commit or push archives automatically.
 
 ### Persistent brief reuse

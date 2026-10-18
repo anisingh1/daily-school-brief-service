@@ -2,6 +2,30 @@
     "version": "2.0.0",
     "tasks": [
         {
+            "label": "Native: prepare Evolution",
+            "type": "process",
+            "command": "/bin/bash",
+            "args": ["${workspaceFolder}/scripts/start_native_databases.sh", "--check-evolution-port"],
+            "options": {"cwd": "${workspaceFolder}"},
+            "problemMatcher": []
+        },
+        {
+            "label": "Native: start databases",
+            "type": "process",
+            "command": "/bin/bash",
+            "args": ["${workspaceFolder}/scripts/start_native_databases.sh"],
+            "options": {"cwd": "${workspaceFolder}"},
+            "problemMatcher": []
+        },
+        {
+            "label": "Native: stop databases",
+            "type": "process",
+            "command": "/bin/bash",
+            "args": ["${workspaceFolder}/scripts/stop_native_databases.sh"],
+            "options": {"cwd": "${workspaceFolder}"},
+            "problemMatcher": []
+        },
+        {
             "label": "Docker: start stack",
             "type": "process",
             "command": "docker",

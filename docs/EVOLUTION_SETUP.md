@@ -183,8 +183,14 @@ Stopping either debug session stops
 both. The existing Python-only launch and a separate **Debug: Evolution API**
 launch are also available.
 
-PostgreSQL and Redis must already be running, Node must be on VS Code's
-PATH, and Evolution must already be built. The compound starts both processes
+The Evolution launch runs **Native: prepare Evolution** to start/reuse native
+PostgreSQL and Redis and wait for database readiness. Stop the Docker stack
+first; an occupied port 8080 stops the task with an actionable error. Node
+must be on VS Code's PATH, and Evolution must already be built.
+When Evolution debugging stops, **Native: stop databases** stops PostgreSQL
+and unloads Redis, including servers reused at startup. This also applies to
+the combined launch. Database files and WhatsApp login state are preserved.
+The compound starts both application processes
 in parallel; it does not wait for Evolution readiness. Wait for its listener
 before calling collection endpoints. Stop any separately running instance on
 port 8080 before using the compound; if Evolution is already running and should
@@ -217,6 +223,14 @@ If it expires, rerun `pair`. Instance creation sets `groupsIgnore=false`,
 `syncFullHistory=true`, `readMessages=false`, `readStatus=false`, and
 `alwaysOnline=false`. The importer does not send WhatsApp messages or mark
 them as read.
+
+When the Python service is running, authenticated `POST /whatsapp/qr` can
+return the PNG directly instead of writing a local QR file. This is suitable
+for cloud deployments and does not require stopping the stack. Follow the
+[pairing API contract](../README.md#whatsapp-qr-pairing-api), including pending
+and already-connected responses. An explicit
+`GET /health?check_connections=true` confirms UDT and WhatsApp connectivity;
+default health responses show the last cached observation.
 
 ```bash
 .venv/bin/python evolution_admin.py status
