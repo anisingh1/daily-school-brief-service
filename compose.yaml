@@ -1,0 +1,121 @@
+name: daily-school-brief
+
+services:
+  postgres:
+    image: postgres:14-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: daily_school_evolution
+      POSTGRES_USER: daily_school_evolution
+      POSTGRES_PASSWORD: ${DOCKER_POSTGRES_PASSWORD:?Set DOCKER_POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U daily_school_evolution -d daily_school_evolution"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-bookworm
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *logging
+
+  evolution:
+    build:
+      context: .
+      dockerfile: docker/evolution.Dockerfile
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SERVER_TYPE: http
+      SERVER_PORT: "8080"
+      SERVER_URL: http://localhost:8080
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY:?Set EVOLUTION_API_KEY in .env}
+      AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "false"
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://daily_school_evolution:${DOCKER_POSTGRES_PASSWORD}@postgres:5432/daily_school_evolution?schema=evolution_api
+      DATABASE_CONNECTION_CLIENT_NAME: daily_school_brief
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_DATA_HISTORIC: "true"
+      DATABASE_DELETE_MESSAGE: "false"
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://redis:6379/6
+      CACHE_REDIS_PREFIX_KEY: daily_school_evolution
+      CACHE_REDIS_SAVE_INSTANCES: "false"
+      CACHE_LOCAL_ENABLED: "false"
+      TELEMETRY_ENABLED: "false"
+      SENTRY_DSN: ""
+      CORS_ORIGIN: "*"
+      CORS_CREDENTIALS: "false"
+      DEL_INSTANCE: "false"
+      LOG_LEVEL: ERROR,WARN,INFO,LOG
+      LOG_BAILEYS: error
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - evolution_instances:/evolution/instances
+      - evolution_store:/evolution/store
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    logging: *logging
+
+  brief:
+    build: .
+    restart: unless-stopped
+    init: true
+    depends_on:
+      evolution:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      SERVICE_HOST: 0.0.0.0
+      SERVICE_PORT: "8000"
+      SERVICE_RELOAD: "false"
+      SERVICE_API_TOKEN: ${DOCKER_SERVICE_API_TOKEN:?Set DOCKER_SERVICE_API_TOKEN in .env}
+      WHATSAPP_SOURCE: evolution
+      EVOLUTION_API_URL: http://evolution:8080
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - brief_data:/app/data
+      - brief_output:/app/output
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000/health', headers={'Authorization':'Bearer '+os.environ['SERVICE_API_TOKEN']}),timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    logging: *logging
+
+volumes:
+  postgres_data:
+  redis_data:
+  evolution_instances:
+  evolution_store:
+  brief_data:
+  brief_output:

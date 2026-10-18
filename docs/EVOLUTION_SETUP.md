@@ -6,6 +6,11 @@ text, captions, and PDF documents directly into the existing archive.
 Evolution is the only supported WhatsApp source; email capture and brief
 email delivery have been removed.
 
+For the migrated four-container stack and switching back to native debugging,
+see [Docker setup](DOCKER_SETUP.md). The native installation below remains
+available as a separate development option; do not run both Evolution copies
+against the same WhatsApp login at once.
+
 ## Account and privacy limitations
 
 Evolution's `WHATSAPP-BAILEYS` connection is an unofficial WhatsApp Web client.

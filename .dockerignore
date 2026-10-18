@@ -1,0 +1,10 @@
+**
+!Dockerfile
+!requirements.txt
+!/*.py
+!docker/
+!docker/**
+!patches/
+!patches/baileys+7.0.0-rc14.patch
+!tests/
+!tests/test_evolution_pairing.mjs

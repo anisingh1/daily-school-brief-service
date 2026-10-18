@@ -43,6 +43,18 @@ second process to run alongside it against the same files.
 
 ## Build And Setup
 
+For the complete four-container setup, use
+[Docker setup and native debugging](docs/DOCKER_SETUP.md). Once configured:
+
+```bash
+docker compose up -d --build --wait --wait-timeout 180
+```
+
+Docker runs Python, patched Evolution, PostgreSQL, and Redis with persistent
+volumes. Native development remains supported; the instructions below describe
+that alternative. Do not run native and Docker copies simultaneously on the
+same ports or WhatsApp login.
+
 Run these commands from the repository root. Python 3.11 has been tested
 locally and is recommended. This is a Python application with no separate
 compilation or frontend build step.

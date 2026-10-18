@@ -1,0 +1,29 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Docker: start stack",
+            "type": "process",
+            "command": "docker",
+            "args": ["compose", "up", "-d", "--build", "--wait", "--wait-timeout", "180"],
+            "options": {"cwd": "${workspaceFolder}"},
+            "problemMatcher": []
+        },
+        {
+            "label": "Docker: stop stack",
+            "type": "process",
+            "command": "docker",
+            "args": ["compose", "down"],
+            "options": {"cwd": "${workspaceFolder}"},
+            "problemMatcher": []
+        },
+        {
+            "label": "Docker: status",
+            "type": "process",
+            "command": "docker",
+            "args": ["compose", "ps"],
+            "options": {"cwd": "${workspaceFolder}"},
+            "problemMatcher": []
+        }
+    ]
+}
