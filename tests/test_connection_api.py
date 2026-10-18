@@ -139,10 +139,19 @@ def test_dependency_failure_is_visible_without_failing_app_liveness(connections,
     assert not client.app.state.operation_lock.locked()
 
 
+def test_old_pairing_route_is_removed(connections):
+    client, state, _ = connections
+    assert client.post("/whatsapp/qr").status_code == 404
+    paths = client.get("/openapi.json").json()["paths"]
+    assert "/whatsapp/qr" not in paths
+    assert "post" in paths["/whatsapp-login"]
+    assert state["requests"] == []
+
+
 def test_qr_returns_png_without_writing_credentials_to_disk(connections):
     client, state, tmp_path = connections
     state["pairing"] = {"base64": "data:image/png;base64," + base64.b64encode(PNG).decode()}
-    response = client.post("/whatsapp/qr")
+    response = client.post("/whatsapp-login")
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/png"
     assert response.headers["cache-control"] == "no-store"
@@ -156,7 +165,7 @@ def test_qr_returns_png_without_writing_credentials_to_disk(connections):
 
 def test_already_connected_qr_request_does_not_log_out_or_recreate_instance(connections):
     client, state, _ = connections
-    response = client.post("/whatsapp/qr")
+    response = client.post("/whatsapp-login")
     assert response.status_code == 409
     assert "already connected" in response.json()["detail"]
     assert response.headers["cache-control"] == "no-store"
@@ -170,7 +179,7 @@ def test_already_connected_qr_request_does_not_log_out_or_recreate_instance(conn
 def test_pending_qr_returns_retry_response_instead_of_fake_image(connections, result):
     client, state, _ = connections
     state["pairing"] = result
-    response = client.post("/whatsapp/qr")
+    response = client.post("/whatsapp-login")
     assert response.status_code == 202
     assert response.json()["status"] == "pending"
     assert response.headers["retry-after"] == "2"
@@ -187,7 +196,7 @@ def test_pending_qr_returns_retry_response_instead_of_fake_image(connections, re
 def test_invalid_upstream_qr_is_rejected(connections, result, caplog):
     client, state, _ = connections
     state["pairing"] = result
-    response = client.post("/whatsapp/qr")
+    response = client.post("/whatsapp-login")
     assert response.status_code == 502
     assert response.headers["cache-control"] == "no-store"
     assert "credentials" not in response.text + caplog.text
@@ -197,7 +206,7 @@ def test_invalid_upstream_qr_is_rejected(connections, result, caplog):
 def test_qr_timeout_reports_failure_and_releases_lock(connections):
     client, state, _ = connections
     state["timeout"] = True
-    response = client.post("/whatsapp/qr")
+    response = client.post("/whatsapp-login")
     assert response.status_code == 502
     assert "private connection details" not in response.text
     assert not client.app.state.operation_lock.locked()
@@ -206,7 +215,7 @@ def test_qr_timeout_reports_failure_and_releases_lock(connections):
 def test_qr_and_live_probes_require_authorization(connections):
     client, state, _ = connections
     client.headers.pop("Authorization")
-    for route in ("/whatsapp/qr", "/health?check_connections=true"):
+    for route in ("/whatsapp-login", "/health?check_connections=true"):
         for headers in ({}, {"Authorization": "Bearer wrong-token"}):
             response = client.post(route, headers=headers) if route.startswith("/whatsapp") else client.get(route, headers=headers)
             assert response.status_code == 401
@@ -218,7 +227,7 @@ def test_pairing_requires_a_configured_token_even_on_localhost(connections, monk
     _, state, _ = connections
     monkeypatch.delenv("SERVICE_API_TOKEN")
     with TestClient(service.create_app()) as client:
-        response = client.post("/whatsapp/qr")
+        response = client.post("/whatsapp-login")
         assert response.status_code == 503
         assert "Configure SERVICE_API_TOKEN" in response.json()["detail"]
     assert state["requests"] == []
@@ -227,7 +236,7 @@ def test_pairing_requires_a_configured_token_even_on_localhost(connections, monk
 def test_busy_pairing_and_live_checks_do_not_disrupt_collection(connections):
     client, state, _ = connections
     with client.app.state.operation_lock:
-        assert client.post("/whatsapp/qr").status_code == 409
+        assert client.post("/whatsapp-login").status_code == 409
         assert client.get("/health?check_connections=true").status_code == 409
         assert client.get("/health").json()["busy"] is True
     assert state["requests"] == []

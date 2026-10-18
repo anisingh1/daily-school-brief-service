@@ -40,7 +40,7 @@ docker compose exec brief python evolution_admin.py status
 ```
 
 For cloud relinking, the Python API also provides authenticated
-`POST /whatsapp/qr`, returning the PNG directly. There is no need to expose
+`POST /whatsapp-login`, returning the PNG directly. There is no need to expose
 Evolution publicly or download a file from its volume. Use the Docker API token
 (`DOCKER_SERVICE_API_TOKEN`) and inspect HTTP status before displaying the
 response: 202 means retry shortly, and 409 can mean already connected or busy.

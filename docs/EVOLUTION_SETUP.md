@@ -224,7 +224,7 @@ If it expires, rerun `pair`. Instance creation sets `groupsIgnore=false`,
 `alwaysOnline=false`. The importer does not send WhatsApp messages or mark
 them as read.
 
-When the Python service is running, authenticated `POST /whatsapp/qr` can
+When the Python service is running, authenticated `POST /whatsapp-login` can
 return the PNG directly instead of writing a local QR file. This is suitable
 for cloud deployments and does not require stopping the stack. Follow the
 [pairing API contract](../README.md#whatsapp-qr-pairing-api), including pending

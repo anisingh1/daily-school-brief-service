@@ -231,7 +231,7 @@ def create_app() -> FastAPI:
             },
         }
 
-    @application.post("/whatsapp/qr", response_class=Response, dependencies=[Depends(authorize)],
+    @application.post("/whatsapp-login", response_class=Response, dependencies=[Depends(authorize)],
                       responses={200: {"content": {"image/png": {}}, "description": "WhatsApp pairing QR PNG"},
                                  202: {"description": "QR not ready; retry shortly"},
                                  409: {"description": "Already connected, or another operation is running"}})

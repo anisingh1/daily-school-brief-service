@@ -18,7 +18,7 @@ PROTECTED_ROUTES = [
     ("POST", "/initialize"),
     ("POST", "/scrape-udt"),
     ("POST", "/fetch-whatsapp"),
-    ("POST", "/whatsapp/qr"),
+    ("POST", "/whatsapp-login"),
     ("GET", "/pdfs/worksheet.pdf"),
 ]
 

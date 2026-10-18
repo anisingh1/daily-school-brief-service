@@ -408,12 +408,12 @@ Authentication is the same as other protected service routes.
 
 ### WhatsApp QR pairing API
 
-`POST /whatsapp/qr` asks Evolution for the current pairing QR. It requires a
+`POST /whatsapp-login` asks Evolution for the current pairing QR. It requires a
 configured `SERVICE_API_TOKEN` and a matching bearer token, including on
 localhost. Docker supplies this from `DOCKER_SERVICE_API_TOKEN`.
 
 ```bash
-curl --fail -X POST http://127.0.0.1:8000/whatsapp/qr \
+curl --fail -X POST http://127.0.0.1:8000/whatsapp-login \
   -H "Authorization: Bearer $SERVICE_API_TOKEN" \
   --output output/whatsapp-qr.png
 ```
