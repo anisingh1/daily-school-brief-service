@@ -5,5 +5,11 @@
         "googleapiclient",
         "LOOKBACK",
         "mypy"
-    ]
+    ],
+    "chat.tools.terminal.autoApprove": {
+        "/^gh api repos/evolution-foundation/evolution-api --jq '\\{description,default_branch,pushed_at,archived,license: \\.license\\.spdx_id\\}'; gh api repos/evolution-foundation/evolution-api/readme --jq \\.content \\| base64 --decode$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
 }

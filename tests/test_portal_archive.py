@@ -1,9 +1,45 @@
 import json
+import os
 from datetime import datetime, timedelta
 
+import pytest
 from dateutil.relativedelta import relativedelta
 
 import portal_archive
+
+
+def test_retention_days_defaults_to_35(monkeypatch):
+    monkeypatch.delenv("ARCHIVE_RETENTION_DAYS", raising=False)
+    assert portal_archive._read_retention_days() == 35
+
+
+def test_retention_days_reads_environment(monkeypatch):
+    monkeypatch.setenv("ARCHIVE_RETENTION_DAYS", "14")
+    monkeypatch.setattr(portal_archive, "RETENTION_DAYS", portal_archive._read_retention_days())
+    now = datetime(2026, 10, 7, 12)
+    assert portal_archive.retention_cutoff(now) == now - timedelta(days=14)
+    assert portal_archive.is_within_retention("2026-09-23T12:00:00", now)
+    assert not portal_archive.is_within_retention("2026-09-23T11:59:59", now)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "1.5", ""])
+def test_retention_days_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("ARCHIVE_RETENTION_DAYS", value)
+    with pytest.raises(ValueError, match="ARCHIVE_RETENTION_DAYS must be a positive integer"):
+        portal_archive._read_retention_days()
+
+
+def test_source_cursors_are_independent(tmp_path, monkeypatch):
+    monkeypatch.setattr(portal_archive, "LAST_RUN_PATH", tmp_path / "last_run.json")
+    assert portal_archive.read_whatsapp_last_run() is None
+    portal_time = datetime(2026, 10, 8, 10)
+    whatsapp_time = datetime(2026, 10, 8, 11)
+    portal_archive.save_last_run(portal_time)
+    portal_archive.save_whatsapp_last_run(whatsapp_time)
+    assert portal_archive.read_last_run() == portal_time
+    assert portal_archive.read_whatsapp_last_run() == whatsapp_time
+    portal_archive.save_last_run(portal_time.replace(hour=12))
+    assert portal_archive.read_whatsapp_last_run() == whatsapp_time
 
 
 def test_read_last_run_returns_none_when_file_missing(tmp_path, monkeypatch):
@@ -23,13 +59,116 @@ def test_save_and_read_last_run_roundtrip(tmp_path, monkeypatch):
 def test_compute_portal_cutoff_uses_last_run_when_present(monkeypatch):
     saved = datetime(2026, 9, 4, 19, 30)
     monkeypatch.setattr(portal_archive, "read_last_run", lambda: saved)
+    monkeypatch.setattr(portal_archive, "retention_cutoff", lambda: datetime(2026, 9, 1))
     assert portal_archive.compute_portal_cutoff() == saved
 
 
-def test_compute_portal_cutoff_falls_back_to_month_anchor_when_absent(monkeypatch):
+def test_compute_portal_cutoff_falls_back_to_retention_when_absent(monkeypatch):
     monkeypatch.setattr(portal_archive, "read_last_run", lambda: None)
-    from cutoff import month_anchor
-    assert portal_archive.compute_portal_cutoff() == month_anchor(months_back=3)
+    cutoff = datetime(2026, 9, 2)
+    monkeypatch.setattr(portal_archive, "retention_cutoff", lambda: cutoff)
+    assert portal_archive.compute_portal_cutoff() == cutoff
+
+
+@pytest.mark.parametrize("days", [1, 7, 60])
+def test_fetch_window_uses_retention_days(monkeypatch, days):
+    monkeypatch.setenv("ARCHIVE_RETENTION_DAYS", str(days))
+    monkeypatch.setattr(portal_archive, "RETENTION_DAYS", portal_archive._read_retention_days())
+    monkeypatch.setattr(portal_archive, "read_last_run", lambda: None)
+    now = datetime(2026, 10, 8, 12, tzinfo=portal_archive.IST)
+    assert portal_archive.retention_cutoff(now) == now.replace(tzinfo=None) - timedelta(days=days)
+    expected = portal_archive.retention_cutoff()
+    assert abs(portal_archive.compute_portal_cutoff() - expected) < timedelta(seconds=1)
+
+
+def test_retention_boundary_and_timezone():
+    now = datetime(2026, 10, 7, 12)
+    assert portal_archive.is_within_retention("2026-09-02T12:00:00", now)
+    assert portal_archive.is_within_retention("2026-09-02T06:30:00+00:00", now)
+    assert not portal_archive.is_within_retention("2026-09-02T11:59:59", now)
+
+
+def test_whatsapp_archive_roundtrip_and_deduplication(tmp_path):
+    path = tmp_path / "whatsapp_messages.json"
+    message = {"timestamp": "2026-10-06T12:00:00+05:30", "sender": "School",
+               "text": "Bring your workbook", "attachments": []}
+    portal_archive.save_archive([message], path)
+    assert portal_archive.merge_into_archive([message], path) == [message]
+    assert portal_archive.load_archive(path) == [message]
+
+
+def test_cleanup_prunes_both_sources_pdfs_and_saved_data(tmp_path, monkeypatch):
+    now = datetime(2026, 10, 7, 12, tzinfo=portal_archive.IST)
+    data_dir = tmp_path / "data"
+    output_dir = tmp_path / "output"
+    pdf_dir = data_dir / "pdfs"
+    pdf_dir.mkdir(parents=True)
+    output_dir.mkdir()
+    monkeypatch.setattr(portal_archive, "DATA_DIR", data_dir)
+    monkeypatch.setattr(portal_archive, "OUTPUT_DIR", output_dir)
+    monkeypatch.setattr(portal_archive, "ARCHIVE_PATH", data_dir / "portal_messages.json")
+    monkeypatch.setattr(portal_archive, "WHATSAPP_ARCHIVE_PATH", data_dir / "whatsapp_messages.json")
+    monkeypatch.setattr(portal_archive, "LAST_RUN_PATH", data_dir / "last_run.json")
+    old_date = (now - timedelta(days=35, seconds=1)).isoformat()
+    recent_date = (now - timedelta(days=35)).isoformat()
+    old_pdf = pdf_dir / "old.pdf"
+    retained_pdf = pdf_dir / "retained.pdf"
+    orphan_pdf = pdf_dir / "orphan.pdf"
+    recent_orphan = pdf_dir / "recent.pdf"
+    outside_pdf = tmp_path / "outside.pdf"
+    for path in (old_pdf, retained_pdf, orphan_pdf, recent_orphan, outside_pdf):
+        path.write_bytes(b"pdf")
+    old = {"id": "old", "posted_at": old_date,
+           "attachments": [{"saved_as": str(old_pdf)}, {"saved_as": str(retained_pdf)},
+                           {"saved_as": str(outside_pdf)}]}
+    recent = {"id": "recent", "posted_at": recent_date,
+              "attachments": [{"saved_as": str(retained_pdf)}]}
+    old_whatsapp = {"timestamp": old_date, "text": "old", "attachments": []}
+    recent_whatsapp = {"timestamp": recent_date, "text": "recent", "attachments": []}
+    portal_archive.save_archive([old, recent])
+    portal_archive.save_archive([old_whatsapp, recent_whatsapp], portal_archive.WHATSAPP_ARCHIVE_PATH)
+    input_path = output_dir / "daily_brief_input.json"
+    portal_archive.write_json(input_path, {
+        "portal": {"messages": [old, recent], "error": None},
+        "whatsapp": {"messages": [old_whatsapp, recent_whatsapp], "error": None},
+    })
+    stale_output = output_dir / "daily_brief_preview.html"
+    stale_output.write_text("stale")
+    stale_data = data_dir / "stale.json"
+    stale_data.write_text("{}")
+    portal_archive.save_last_run(now)
+    old_time = (now - timedelta(days=36)).timestamp()
+    cache_dir = data_dir / "pdf_cache"
+    cache_dir.mkdir()
+    import hashlib
+    retained_hash = hashlib.sha256(retained_pdf.read_bytes()).hexdigest()
+    retained_cache = cache_dir / f"{retained_hash}_v1.json"
+    retained_cache.write_text("{}")
+    expired_cache = cache_dir / ("0" * 64 + "_v1.json")
+    expired_cache.write_text("{}")
+    os.utime(retained_cache, (old_time, old_time))
+    for path in (retained_pdf, orphan_pdf, stale_output, stale_data, portal_archive.LAST_RUN_PATH):
+        os.utime(path, (old_time, old_time))
+
+    stored = portal_archive.cleanup_stored_data(now)
+
+    assert stored == {"portal": [recent], "whatsapp": [recent_whatsapp]}
+    assert portal_archive.load_archive() == [recent]
+    assert portal_archive.load_archive(portal_archive.WHATSAPP_ARCHIVE_PATH) == [recent_whatsapp]
+    assert not old_pdf.exists()
+    assert not orphan_pdf.exists()
+    assert not stale_output.exists()
+    assert not stale_data.exists()
+    assert retained_pdf.exists()
+    assert recent_orphan.exists()
+    assert outside_pdf.exists()
+    assert portal_archive.LAST_RUN_PATH.exists()
+    assert retained_cache.exists()
+    assert not expired_cache.exists()
+    saved_input = json.loads(input_path.read_text())
+    assert saved_input["portal"]["messages"] == [recent]
+    assert saved_input["whatsapp"]["messages"] == [recent_whatsapp]
+    assert portal_archive.cleanup_stored_data(now) == stored
 
 
 def test_load_archive_returns_empty_list_when_file_missing(tmp_path, monkeypatch):

@@ -2,47 +2,18 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug: daily_brief.py",
+            "name": "Debug: service.py",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/daily_brief.py",
+            "program": "${workspaceFolder}/service.py",
             "console": "integratedTerminal",
             "python": "${workspaceFolder}/.venv/bin/python",
             "cwd": "${workspaceFolder}",
             "envFile": "${workspaceFolder}/.env",
-            "justMyCode": true
-        },
-        {
-            "name": "Debug: scrape_udt.py",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/scrape_udt.py",
-            "console": "integratedTerminal",
-            "python": "${workspaceFolder}/.venv/bin/python",
-            "cwd": "${workspaceFolder}",
-            "envFile": "${workspaceFolder}/.env",
-            "justMyCode": true
-        },
-        {
-            "name": "Debug: fetch_whatsapp.py",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/fetch_whatsapp.py",
-            "console": "integratedTerminal",
-            "python": "${workspaceFolder}/.venv/bin/python",
-            "cwd": "${workspaceFolder}",
-            "envFile": "${workspaceFolder}/.env",
-            "justMyCode": true
-        },
-        {
-            "name": "Debug: pytest (current file)",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "pytest",
-            "args": ["${file}", "-v"],
-            "console": "integratedTerminal",
-            "python": "${workspaceFolder}/.venv/bin/python",
-            "cwd": "${workspaceFolder}",
+            "env": {
+                "SERVICE_RELOAD": "true"
+            },
+            "subProcess": true,
             "justMyCode": true
         }
     ]

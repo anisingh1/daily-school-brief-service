@@ -218,6 +218,35 @@ def fetch_recent_messages(
     return filtered
 
 
+def fetch_attendance(start: datetime, end: datetime) -> list[dict]:
+    records = {}
+    month = start.replace(day=1)
+    with requests.Session() as session:
+        session.headers.update(HEADERS)
+        login(session)
+        while (month.year, month.month) <= (end.year, end.month):
+            response = session.get(
+                f"{BASE_URL}/parents/get-student-attendance-data",
+                params={"year": month.year, "month": month.month},
+                timeout=30,
+            )
+            response.raise_for_status()
+            entries = response.json()
+            if not isinstance(entries, list):
+                raise ValueError("Invalid attendance response")
+            for entry in entries:
+                attendance_date = datetime.strptime(entry["date"], "%Y-%m-%d").date()
+                status = entry["title"].strip().lower()
+                if status not in {"present", "absent", "leave"}:
+                    raise ValueError("Unknown attendance status")
+                if start.date() <= attendance_date <= end.date():
+                    records[attendance_date.isoformat()] = {
+                        "date": attendance_date.isoformat(), "status": status,
+                    }
+            month = month.replace(year=month.year + month.month // 12, month=month.month % 12 + 1)
+    return [records[date] for date in sorted(records)]
+
+
 def run():
     filtered = fetch_recent_messages(download_attachments=True)
     if not filtered:

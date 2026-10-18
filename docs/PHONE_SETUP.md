@@ -1,5 +1,8 @@
 # Phone-Side WhatsApp Capture Setup
 
+These instructions apply to `WHATSAPP_SOURCE=email` (the default).
+For direct ingestion without phone forwarding, see [EVOLUTION_SETUP.md](EVOLUTION_SETUP.md).
+
 This captures messages (and documents) from the school WhatsApp group
 without any unofficial WhatsApp client or automation library - it works
 entirely through Android's own notification and file systems, and
@@ -20,6 +23,13 @@ filter, or label is required - `fetch_whatsapp.py` finds these emails by
 searching IMAP for mail addressed `TO` that alias. Put it in
 `WHATSAPP_EMAIL_TO` in `.env`.
 
+Use `[WhatsApp School]` as the subject prefix for capture emails. The service
+requires this marker as well as the recipient address to distinguish captures
+from other email. Set `WHATSAPP_SUBJECT_PREFIX` only if you want a different
+marker, and use exactly the same value in both phone rules. Subjects must start
+with the marker followed by a space, or consist of the marker alone. Existing
+emails without the marker are ignored; update the phone rules before collecting.
+
 ## 3. Create the text-message capture rule
 
 - Trigger: **Notification Received** -> app: WhatsApp -> title/text
@@ -27,7 +37,7 @@ searching IMAP for mail addressed `TO` that alias. Put it in
 - Action: **Send Email** (MacroDroid's native email action, not "open
   Gmail app"):
   - To: the address from step 2
-  - Subject: `%notification_title%` (the sender's name)
+  - Subject: `[WhatsApp School] %notification_title%` (marker plus sender's name)
   - Body: `%notification_text%` (the message text)
 
   Unlike writing a JSON line to a file, a plain email body has no
@@ -46,9 +56,13 @@ instead - check which exists on your phone).
   path above.
 - Action: **Send Email**, with the trigger's file attached:
   - To: the address from step 2
-  - Subject: anything (not read by `fetch_whatsapp.py` for this rule)
+  - Subject: `[WhatsApp School] Document`
   - Attachment: the newly added file (MacroDroid's file-added trigger
     exposes the file path as a local variable to attach)
+
+  Only mark documents verified to be from the school group. The marker does
+  not identify the originating chat: leave this folder rule disabled unless
+  it is school-only, or manually email school PDFs with the marked subject.
 
   **Caveat - not scoped to the school group:** WhatsApp doesn't
   separate this folder by chat, so this rule will email *every*

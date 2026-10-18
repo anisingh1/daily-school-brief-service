@@ -1,0 +1,117 @@
+diff --git a/node_modules/baileys/lib/Socket/socket.js b/node_modules/baileys/lib/Socket/socket.js
+index ae34a8f..8344414 100644
+--- a/node_modules/baileys/lib/Socket/socket.js
++++ b/node_modules/baileys/lib/Socket/socket.js
+@@ -12,6 +12,7 @@ import { BinaryInfo } from '../WAM/BinaryInfo.js';
+ import { USyncQuery, USyncUser } from '../WAUSync/index.js';
+ import { WebSocketClient } from './Client/index.js';
+ import { executeWMexQuery } from './mex.js';
++import { handleCompanionRegRefresh, makePairingQRRenderer } from '../Utils/companion-reg-client-utils.js';
+ /**
+  * Connects to WA servers and performs:
+  * - simple queries (no retry mechanism, wait for connection establishment)
+@@ -690,6 +691,7 @@ export const makeSocket = (config) => {
+     ws.on('close', () => void end(new Boom('Connection Terminated', { statusCode: DisconnectReason.connectionClosed })));
+     // the server terminated the connection
+     ws.on('CB:xmlstreamend', () => void end(new Boom('Connection Terminated by Server', { statusCode: DisconnectReason.connectionClosed })));
++    let refreshPairingQR;
+     // QR gen
+     ws.on('CB:iq,type:set,pair-device', async (stanza) => {
+         const iq = {
+@@ -705,25 +707,35 @@ export const makeSocket = (config) => {
+         const refNodes = getBinaryNodeChildren(pairDeviceNode, 'ref');
+         const noiseKeyB64 = Buffer.from(creds.noiseKey.public).toString('base64');
+         const identityKeyB64 = Buffer.from(creds.signedIdentityKey.public).toString('base64');
+-        const advB64 = creds.advSecretKey;
++        const renderer = makePairingQRRenderer(
++            refNodes.map(refNode => refNode.content.toString('utf-8')),
++            ref => ev.emit('connection.update', {
++                qr: buildPairingQRData(ref, noiseKeyB64, identityKeyB64, creds.advSecretKey, browser)
++            })
++        );
++        refreshPairingQR = () => void renderer.refresh();
+         let qrMs = qrTimeout || 60000; // time to let a QR live
+         const genPairQR = () => {
+             if (!ws.isOpen) {
+                 return;
+             }
+-            const refNode = refNodes.shift();
+-            if (!refNode) {
++            if (!renderer.next()) {
+                 void end(new Boom('QR refs attempts ended', { statusCode: DisconnectReason.timedOut }));
+                 return;
+             }
+-            const ref = refNode.content.toString('utf-8');
+-            const qr = buildPairingQRData(ref, noiseKeyB64, identityKeyB64, advB64, browser);
+-            ev.emit('connection.update', { qr });
+             qrTimer = setTimeout(genPairQR, qrMs);
+             qrMs = qrTimeout || 20000; // shorter subsequent qrs
+         };
+         genPairQR();
+     });
++    ws.on('CB:notification,type:companion_reg_refresh', node => {
++        handleCompanionRegRefresh(node, {
++            creds,
++            emitCredsUpdate: update => ev.emit('creds.update', update),
++            refreshQR: () => refreshPairingQR?.(),
++            logger
++        });
++    });
+     // device paired for the first time
+     // if device pairs successfully, the server asks to restart the connection
+     ws.on('CB:iq,,pair-success', async (stanza) => {
+diff --git a/node_modules/baileys/lib/Utils/companion-reg-client-utils.js b/node_modules/baileys/lib/Utils/companion-reg-client-utils.js
+index f5edebd..d5fa617 100644
+--- a/node_modules/baileys/lib/Utils/companion-reg-client-utils.js
++++ b/node_modules/baileys/lib/Utils/companion-reg-client-utils.js
+@@ -1,3 +1,6 @@
++import { randomBytes } from 'crypto';
++import { getBinaryNodeChild } from '../WABinary/index.js';
++
+ export var CompanionWebClientType;
+ (function (CompanionWebClientType) {
+     CompanionWebClientType[CompanionWebClientType["UNKNOWN"] = 0] = "UNKNOWN";
+@@ -32,4 +35,42 @@ export const buildPairingQRData = (ref, noiseKeyB64, identityKeyB64, advB64, bro
+     return ('https://wa.me/settings/linked_devices#' +
+         [ref, noiseKeyB64, identityKeyB64, advB64, getCompanionPlatformId(browser)].join(','));
+ };
++export const makePairingQRRenderer = (refs, render) => {
++    let index = 0;
++    let current;
++    return {
++        next() {
++            const ref = refs[index];
++            if (ref === undefined) {
++                return false;
++            }
++            index += 1;
++            current = ref;
++            render(ref);
++            return true;
++        },
++        refresh() {
++            if (current === undefined) {
++                return false;
++            }
++            render(current);
++            return true;
++        }
++    };
++};
++export const handleCompanionRegRefresh = (node, { creds, emitCredsUpdate, refreshQR, logger }) => {
++    if (!['companion_reg_refresh', 'pair-device-rotate-qr'].some(tag => getBinaryNodeChild(node, tag))) {
++        logger.warn({ node }, 'companion_reg_refresh carries neither expected child; ignoring');
++        return 'ignored_malformed';
++    }
++    if (creds.me) {
++        logger.debug({ id: node.attrs.id }, 'companion_reg_refresh on a registered session; keeping the adv secret');
++        return 'ignored_registered';
++    }
++    creds.advSecretKey = randomBytes(32).toString('base64');
++    emitCredsUpdate({ advSecretKey: creds.advSecretKey });
++    logger.info({ id: node.attrs.id }, 'rotated the adv secret the server asked to retire; re-rendering the pairing QR');
++    refreshQR();
++    return 'rotated';
++};
+ //# sourceMappingURL=companion-reg-client-utils.js.map
+\ No newline at end of file
