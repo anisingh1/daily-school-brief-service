@@ -11,6 +11,95 @@ import generate_brief
 import portal_archive
 
 
+@pytest.fixture
+def azure_settings(monkeypatch):
+    monkeypatch.setattr(generate_brief, "load_dotenv", lambda *args: None)
+    for name, value in {
+        "AZURE_OPENAI_ENDPOINT": "https://azure.test",
+        "AZURE_OPENAI_API_VERSION": "2025-04-01-preview",
+        "AZURE_OPENAI_API_KEY": "test-key",
+    }.items():
+        monkeypatch.setenv(name, value)
+    for name in ("AZURE_OPENAI_DEPLOYMENT", "AZURE_OPENAI_PDF_DEPLOYMENT", "AZURE_OPENAI_BRIEF_DEPLOYMENT"):
+        monkeypatch.delenv(name, raising=False)
+    client = Mock(spec=generate_brief.AzureOpenAI)
+    constructor = Mock(return_value=client)
+    monkeypatch.setattr(generate_brief, "AzureOpenAI", constructor)
+    return client, constructor
+
+
+@pytest.mark.parametrize("task", ["pdf", "brief"])
+@pytest.mark.parametrize("specific,shared,expected", [
+    ("task-model", "legacy-model", "task-model"),
+    (" task-model ", "legacy-model", "task-model"),
+    ("task-model", None, "task-model"),
+    (None, "legacy-model", "legacy-model"),
+    (" \t ", " legacy-model ", "legacy-model"),
+])
+def test_task_deployments_override_shared_fallback(azure_settings, monkeypatch, task, specific, shared, expected):
+    client, constructor = azure_settings
+    if specific is not None:
+        monkeypatch.setenv(f"AZURE_OPENAI_{task.upper()}_DEPLOYMENT", specific)
+    if shared is not None:
+        monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", shared)
+    assert generate_brief.create_client(task=task) == (client, expected)
+    constructor.assert_called_once_with(
+        azure_endpoint="https://azure.test", api_key="test-key",
+        api_version="2025-04-01-preview", timeout=120.0, max_retries=2,
+    )
+
+
+@pytest.mark.parametrize("task", ["pdf", "brief"])
+def test_missing_task_and_shared_deployment_fails_explicitly(azure_settings, task):
+    _, constructor = azure_settings
+    with pytest.raises(ValueError, match=f"AZURE_OPENAI_{task.upper()}_DEPLOYMENT"):
+        generate_brief.create_client(task=task)
+    constructor.assert_not_called()
+
+
+@pytest.mark.parametrize("shared", [None, "legacy-model"])
+def test_generation_uses_separate_models_and_preserves_pdf_cache(azure_settings, tmp_path, monkeypatch, shared):
+    client, _ = azure_settings
+    monkeypatch.setattr(generate_brief, "ROOT", tmp_path)
+    monkeypatch.setattr(generate_brief, "PDF_DIR", tmp_path / "data" / "pdfs")
+    monkeypatch.setenv("AZURE_OPENAI_PDF_DEPLOYMENT", "pdf-model")
+    monkeypatch.setenv("AZURE_OPENAI_BRIEF_DEPLOYMENT", "brief-model")
+    if shared is not None:
+        monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", shared)
+    generate_brief.PDF_DIR.mkdir(parents=True)
+    path = generate_brief.PDF_DIR / "worksheet.pdf"
+    with pymupdf.open() as document:
+        document.new_page().insert_text((72, 72), "Read page 12")
+        document.save(path)
+    data = {"portal": {"messages": [{"attachments": [{"saved_as": str(path)}]}]}}
+
+    def create(**kwargs):
+        name = kwargs["response_format"]["json_schema"]["name"]
+        if name == "pdf_text":
+            assert any(part["type"] == "image_url" for part in kwargs["messages"][1]["content"])
+            content = json.dumps({
+                "category": "notebook_page", "pages": [{"page": 1, "text": "Read page 12"}],
+                "warnings": [],
+            })
+        else:
+            assert all(part["type"] == "text" for part in kwargs["messages"][1]["content"])
+            content = generate_brief.empty_brief("date", []).model_dump_json()
+        return SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="stop", message=SimpleNamespace(refusal=None, content=content),
+        )])
+
+    client.chat.completions.create.side_effect = create
+    now = datetime(2026, 10, 15, 12, tzinfo=generate_brief.IST)
+    generate_brief.generate(data, now)
+    generate_brief.generate(data, now)
+    monkeypatch.setenv("AZURE_OPENAI_PDF_DEPLOYMENT", "new-pdf-model")
+    monkeypatch.setenv("AZURE_OPENAI_BRIEF_DEPLOYMENT", "new-brief-model")
+    generate_brief.generate(data, now)
+    assert [call.kwargs["model"] for call in client.chat.completions.create.call_args_list] == [
+        "pdf-model", "brief-model", "brief-model", "new-brief-model",
+    ]
+
+
 @pytest.mark.parametrize("highlight", [None, "", "   ", "Aviraj: bring an assembly prop tomorrow"])
 @pytest.mark.parametrize("duplicate", [False, True])
 def test_legacy_highlight_moves_to_reminders_and_leaves_schema(highlight, duplicate):

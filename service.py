@@ -66,7 +66,7 @@ def prepare_storage(data: dict[str, Any]) -> dict[str, Any]:
         for attachment in message.get("attachments", [])
     )
     if has_pdfs:
-        client, deployment = generate_brief.create_client()
+        client, deployment = generate_brief.create_client(task="pdf")
         try:
             payload, pdf_warnings, _ = generate_brief.prepare_input(
                 data, client=client, deployment=deployment,

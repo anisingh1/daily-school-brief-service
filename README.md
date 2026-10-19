@@ -73,10 +73,15 @@ cp .env.example .env
 Do not overwrite an existing `.env`. Fill in these settings:
 
 - `UDT_BASE_URL`, `UDT_USERNAME`, `UDT_PASSWORD`: school portal access.
-- `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`,
-  `AZURE_OPENAI_API_VERSION`, `AZURE_OPENAI_API_KEY`: your Azure deployment.
-  Use the deployment name, not the model family name. It must support Chat
-  Completions, strict JSON-schema structured outputs, and image input.
+- `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_VERSION`,
+  `AZURE_OPENAI_API_KEY`: shared Azure connection settings.
+- `AZURE_OPENAI_PDF_DEPLOYMENT`: deployment for PDF transcription/classification.
+  It must support Chat Completions, strict JSON-schema outputs, and image input.
+- `AZURE_OPENAI_BRIEF_DEPLOYMENT`: deployment for final brief generation.
+  It must support Chat Completions and strict JSON-schema outputs.
+  Use Azure deployment names, not model family names.
+  Unset or blank task settings use the existing `AZURE_OPENAI_DEPLOYMENT`
+  shared fallback, so existing configurations continue working.
 - Configure `EVOLUTION_API_URL`,
   `EVOLUTION_API_KEY`, `EVOLUTION_INSTANCE`, and `EVOLUTION_GROUP_JID`.
   Follow [docs/EVOLUTION_SETUP.md](docs/EVOLUTION_SETUP.md) for native installation,
@@ -94,6 +99,23 @@ positive integer. Keep `.env` private and never commit it. School messages and
 PDF pages are sent to your configured Azure endpoint; review data-handling
 requirements before running. Azure requests use a 120-second timeout and at
 most two SDK retries.
+
+For example, after deploying the selected models in the same Azure resource:
+
+```dotenv
+AZURE_OPENAI_PDF_DEPLOYMENT=school-pdf-mini
+AZURE_OPENAI_BRIEF_DEPLOYMENT=school-brief-mini
+```
+
+These are example deployment names, not deployments created by this app.
+Both tasks share the endpoint, API key, and API version. Configure both task
+settings before removing the shared `AZURE_OPENAI_DEPLOYMENT`. PDF-only
+initialization/collection does not require a brief deployment. Restart native
+debugging or recreate the Docker service after changing `.env`.
+Valid PDF transcriptions remain cached by file hash/extraction version when
+models change; changing a deployment does not retranscribe existing PDFs.
+During full brief generation, if neither PDF nor shared deployment is set,
+PDF extraction uses the brief deployment; it must then also support images.
 
 ## Scheduled Service
 
@@ -156,7 +178,7 @@ retention cleanup, even during initialization. It does not generate a brief.
 The response reports retained message/document counts and warnings.
 The portal currently exposes one activity page; unavailable historical messages
 cannot be recovered by this endpoint. PDF transcription uses the configured Azure
-deployment and may take time on the initial scan.
+PDF deployment and may take time on the initial scan.
 
 Initialization, scheduled polling, `POST /refresh`, and `POST /scrape-udt` also
 fetch the portal's dedicated attendance endpoint for each month in the retention
@@ -453,7 +475,7 @@ not depend on in-memory state. The shared CLI/service generator checks:
 - Retained messages, source errors, attachment metadata, and attendance records.
 - PDF bytes and validated cached transcriptions, including extraction version.
 - IST date context: midnight and the 08:30 dress-code cutoff invalidate reuse.
-- Generation implementation, prompt/schema, Azure endpoint/deployment/API version,
+- Generation implementation, prompt/schema, Azure endpoint/shared and task deployments/API version,
   and `SERVICE_PUBLIC_URL`. API keys are not stored in cache metadata.
 
 Collection cursors, poll timestamps, and file modification times are not inputs.

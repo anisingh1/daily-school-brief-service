@@ -67,6 +67,7 @@ def test_unchanged_run_reuses_persistent_content_without_creating_azure_client(c
 @pytest.mark.parametrize("change", [
     "message", "error", "attendance", "prompt", "pdf_version",
     "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT", "AZURE_OPENAI_API_VERSION", "SERVICE_PUBLIC_URL",
+    "AZURE_OPENAI_PDF_DEPLOYMENT", "AZURE_OPENAI_BRIEF_DEPLOYMENT",
 ])
 def test_relevant_changes_invalidate_brief(cached_pipeline, monkeypatch, change):
     data, now, calls = cached_pipeline
@@ -135,6 +136,17 @@ def test_changed_pdf_bytes_invalidate_even_when_path_is_unchanged(cached_pipelin
     assert generate_brief.run_with_status(data, now)[1] is False
     assert generate_brief.run_with_status(data, now)[1] is True
     assert calls == ["pdf_text", "school_brief", "pdf_text", "school_brief"]
+
+
+@pytest.mark.parametrize("setting", ["AZURE_OPENAI_PDF_DEPLOYMENT", "AZURE_OPENAI_BRIEF_DEPLOYMENT"])
+def test_deployment_change_invalidates_brief_but_reuses_pdf_cache(cached_pipeline, monkeypatch, setting):
+    data, now, calls = cached_pipeline
+    add_pdf(data)
+    generate_brief.run(data, now)
+    monkeypatch.setenv(setting, "new-deployment")
+    assert generate_brief.run_with_status(data, now)[1] is False
+    assert generate_brief.run_with_status(data, now)[1] is True
+    assert calls == ["pdf_text", "school_brief", "school_brief"]
 
 
 @pytest.mark.parametrize("damage", ["metadata-missing", "metadata-invalid", "brief-missing", "brief-invalid", "brief-edited"])

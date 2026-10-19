@@ -96,6 +96,12 @@ links with an authorization header; plain unauthenticated links no longer work.
 Azure/portal/WhatsApp settings remain required. No `.env`, school data, or
 native session is copied into either image.
 
+Set `AZURE_OPENAI_PDF_DEPLOYMENT` and `AZURE_OPENAI_BRIEF_DEPLOYMENT` in `.env`
+to use separate Azure deployments for PDF extraction and brief generation.
+Both use the same endpoint, API key, and API version. Blank task settings use
+the shared `AZURE_OPENAI_DEPLOYMENT` fallback. Compose passes these settings
+through without overrides; recreate `brief` after changing them.
+
 For a fresh installation, configure `.env`, run the startup command, then
 create/pair/select the WhatsApp instance with `docker compose exec brief python
 evolution_admin.py ...`. Initialize and refresh through the authenticated API.

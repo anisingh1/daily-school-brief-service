@@ -377,7 +377,7 @@ def extract_pdf_text(client: AzureOpenAI, deployment: str, pages: list[dict],
         "json_schema": {"name": "pdf_text", "strict": True, "schema": PDFText.model_json_schema()},
     }
     started = monotonic()
-    LOGGER.info("Azure PDF extraction started: pages=%d", len(pages))
+    LOGGER.info("Azure PDF extraction started: deployment=%s, pages=%d", deployment, len(pages))
     response = client.chat.completions.create(model=deployment, messages=messages, response_format=response_format)
     LOGGER.info("Azure PDF extraction returned in %.2fs", monotonic() - started)
     if not response.choices:
@@ -529,14 +529,25 @@ def prepare_input(data: dict[str, Any], now: datetime | None = None, *,
     return payload, warnings, images
 
 
-def create_client() -> tuple[AzureOpenAI, str]:
+def deployment_for(task: Literal["pdf", "brief"], fallback: str = "") -> str:
+    return (
+        os.getenv(f"AZURE_OPENAI_{task.upper()}_DEPLOYMENT", "").strip()
+        or os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
+        or fallback
+    )
+
+
+def create_client(*, task: Literal["pdf", "brief"] = "brief") -> tuple[AzureOpenAI, str]:
     load_dotenv(ROOT / ".env")
     names = (
-        "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT",
+        "AZURE_OPENAI_ENDPOINT",
         "AZURE_OPENAI_API_VERSION", "AZURE_OPENAI_API_KEY",
     )
     settings = {name: os.getenv(name, "").strip() for name in names}
     missing = [name for name, value in settings.items() if not value or (name == "AZURE_OPENAI_API_KEY" and value == "key")]
+    deployment = deployment_for(task)
+    if not deployment:
+        missing.append(f"AZURE_OPENAI_{task.upper()}_DEPLOYMENT (or AZURE_OPENAI_DEPLOYMENT)")
     if missing:
         raise ValueError("Configure " + ", ".join(missing) + " in .env")
     LOGGER.info("Creating Azure client: timeout=120s per attempt, max_retries=2")
@@ -545,7 +556,7 @@ def create_client() -> tuple[AzureOpenAI, str]:
         api_key=settings["AZURE_OPENAI_API_KEY"],
         api_version=settings["AZURE_OPENAI_API_VERSION"],
         timeout=120.0, max_retries=2,
-    ), settings["AZURE_OPENAI_DEPLOYMENT"]
+    ), deployment
 
 
 def generate(data: dict[str, Any], now: datetime | None = None, *,
@@ -564,7 +575,7 @@ def generate(data: dict[str, Any], now: datetime | None = None, *,
         started = monotonic()
         LOGGER.info("Preparing brief input: messages=%d",
                     sum(len(source.get("messages", [])) for source in data.values()))
-        payload, warnings, images = prepare_input(data, now, client=client, deployment=deployment,
+        payload, warnings, images = prepare_input(data, now, client=client, deployment=deployment_for("pdf", deployment),
                                                  pdf_snapshot=pdf_snapshot, cache_writes=cache_writes)
         LOGGER.info("Brief input prepared in %.2fs: documents=%d, image_parts=%d",
                     monotonic() - started, len(payload["documents"]), len(images))
@@ -584,7 +595,7 @@ def generate(data: dict[str, Any], now: datetime | None = None, *,
             "json_schema": {"name": "school_brief", "strict": True, "schema": schema},
         }
         started = monotonic()
-        LOGGER.info("Azure brief generation started")
+        LOGGER.info("Azure brief generation started: deployment=%s", deployment)
         response = client.chat.completions.create(
             model=deployment,
             messages=messages,
@@ -676,6 +687,7 @@ def brief_input_hash(data: dict[str, Any], now: datetime, snapshot: PDFSnapshot)
         "pdf_cache_version": PDF_CACHE_VERSION,
         "settings": {key: os.getenv(key, "").strip() for key in (
             "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT", "AZURE_OPENAI_API_VERSION",
+            "AZURE_OPENAI_PDF_DEPLOYMENT", "AZURE_OPENAI_BRIEF_DEPLOYMENT",
             "SERVICE_PUBLIC_URL",
         )},
     }), complete

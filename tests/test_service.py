@@ -39,7 +39,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(service.generate_brief, "CONTENT_PATH", tmp_path / "output" / "daily_brief_content.json")
     monkeypatch.setattr(service.daily_brief, "fetch_recent_messages", lambda **kwargs: pytest.fail("Unexpected portal fetch"))
     monkeypatch.setattr(service.daily_brief, "fetch_recent_whatsapp_messages", lambda **kwargs: pytest.fail("Unexpected Evolution fetch"))
-    monkeypatch.setattr(service.generate_brief, "create_client", lambda: pytest.fail("Unexpected Azure call"))
+    monkeypatch.setattr(service.generate_brief, "create_client", lambda **kwargs: pytest.fail("Unexpected Azure call"))
     with TestClient(service.create_app(), headers={"Authorization": "Bearer test-token"}) as test_client:
         yield test_client
 
@@ -381,7 +381,7 @@ def test_initialize_and_whatsapp_fetch_only_transcribe_uncached_pdfs(client, mon
         )])
 
     azure = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)), close=lambda: None)
-    monkeypatch.setattr(service.generate_brief, "create_client", lambda: (azure, "deployment"))
+    monkeypatch.setattr(service.generate_brief, "create_client", lambda **kwargs: (azure, "deployment"))
     monkeypatch.setattr(service.generate_brief, "generate", lambda *args, **kwargs: pytest.fail("Unexpected final generation"))
     monkeypatch.setattr(service.daily_brief, "run", lambda **kwargs: data)
     for route in ("/initialize", "/fetch-whatsapp"):
@@ -536,11 +536,15 @@ def test_preparing_storage_closes_client_and_caches_pdf(monkeypatch):
     data = {"portal": {"messages": [{"attachments": [{"saved_as": "planner.pdf"}]}], "error": None}}
     calls = []
     client = SimpleNamespace(close=lambda: calls.append("close"))
-    monkeypatch.setattr(service.generate_brief, "create_client", lambda: (client, "deployment"))
+    def create_client(*, task):
+        assert task == "pdf"
+        return client, "pdf-deployment"
+
+    monkeypatch.setattr(service.generate_brief, "create_client", create_client)
 
     def prepare(source, **kwargs):
         assert source == data
-        assert kwargs == {"client": client, "deployment": "deployment"}
+        assert kwargs == {"client": client, "deployment": "pdf-deployment"}
         calls.append("extract")
         return {"documents": [{}]}, [], []
 
